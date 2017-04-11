@@ -1,5 +1,7 @@
 # Validate XML against XML Schema using Rust
 
+[![Build Status](https://travis-ci.org/FranklinChen/validate-xml-rust.png)](https://travis-ci.org/FranklinChen/validate-xml-rust)
+
 ## Prerequisites
 
 Cargo for Rust is required. I recommend installing [`rustup`](https://www.rustup.rs/) with the instructions
