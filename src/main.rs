@@ -118,6 +118,10 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
         // Already cached. (Hopefully not trash.)
     } else {
         // Synchronously download from Web to local file.
+
+        // DEBUG to show that download happens only once.
+        println!("Downloading now {}...", url);
+
         let mut response = CLIENT.get(url).send().unwrap();
         let mut new_file = File::create(file_path.clone()).unwrap();
         let mut buf = Vec::new();
@@ -155,9 +159,6 @@ fn get_schema(url: String) -> XmlSchemaPtr {
         m.get(&url)
             .map(|&s| s)
             .unwrap_or_else(|| {
-                // DEBUG to show that download happens only once.
-                println!("Downloading now {}...", url);
-
                 let schema = download_schema(&url);
                 m.insert(url, schema);
                 schema
