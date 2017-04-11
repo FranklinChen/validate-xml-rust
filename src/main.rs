@@ -36,7 +36,6 @@ struct Args {
 
 use std::ffi::CString;
 use std::collections::HashMap;
-use std::env;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::fs::File;
