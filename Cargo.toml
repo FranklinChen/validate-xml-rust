@@ -1,0 +1,14 @@
+[package]
+name = "validate-xml"
+version = "0.1.0"
+authors = ["Franklin Chen <franklinchen@franklinchen.com>"]
+
+[dependencies]
+parking_lot = "*"
+walkdir = "*"
+rayon = "*"
+regex = "*"
+lazy_static = "*"
+libc = "*"
+docopt = "*"
+rustc-serialize = "*"
