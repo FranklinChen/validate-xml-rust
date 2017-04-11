@@ -16,20 +16,18 @@ const USAGE: &'static str = "
 Validate XML files concurrently and downloading remote XML Schemas only once.
 
 Usage:
-  validate-xml [--threads=<threads>] [--extension=<extension>] <dir>
+  validate-xml [--extension=<extension>] <dir>
   validate-xml (-h | --help)
   validate-xml --version
 
 Options:
   -h --help                Show this screen.
   --version                Show version.
-  --threads=<threads>      Number of threads [default: 200].
   --extension=<extension>  File extension of XML files [default: .cmdi].
 ";
 
 #[derive(Debug, RustcDecodable)]
 struct Args {
-    flag_threads: usize,
     flag_extension: String,
     arg_dir: String,
 }
@@ -168,9 +166,6 @@ fn main() {
     let args: Args = Docopt::new(USAGE)
         .and_then(|d| d.decode())
         .unwrap_or_else(|e| e.exit());
-
-    rayon::initialize(rayon::Configuration::new().num_threads(args.flag_threads)).unwrap();
-
     unsafe {
         xmlInitParser();
         xmlInitGlobals();
