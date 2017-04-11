@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate lazy_static;
 
+extern crate hyper;
 extern crate rustc_serialize;
 extern crate docopt;
 
@@ -32,16 +33,20 @@ struct Args {
     arg_dir: String,
 }
 
+use std::env;
+use std::fs;
 use std::ffi::CString;
 use std::collections::HashMap;
+use std::io;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use regex::Regex;
 use parking_lot::RwLock;
 use walkdir::{DirEntry, WalkDir};
 use rayon::prelude::*;
+use hyper::Client;
 
 /// For libxml2 FFI.
 use libc::{c_char, c_int, c_uint, FILE};
@@ -92,8 +97,35 @@ fn extract_schema_url(path: &Path) -> String {
     unreachable!()
 }
 
+
+/// Cache into ~/.xmlschemas/ directory.
 fn download_schema(url: &str) -> XmlSchemaPtr {
-    let c_url = CString::new(url).unwrap();
+    lazy_static! {
+        static ref CLIENT: Client = Client::new();
+
+        static ref SCHEMA_DIR: PathBuf = {
+            let home_dir = env::home_dir().unwrap();
+            home_dir.as_path().join(".xmlschemas")
+        };
+    }
+
+    fs::create_dir(SCHEMA_DIR.as_path());
+    let encoded_file_name = url.replace("/", "%2F");
+    let file_path = SCHEMA_DIR.join(encoded_file_name);
+    //let file_path_str = file_path.to_str().unwrap();
+
+    if let Ok(attr) = fs::metadata(file_path.clone()) {
+        // Already cached. (Hopefully not trash.)
+    } else {
+        // Synchronously download from Web to local file.
+        let mut response = CLIENT.get(url).send().unwrap();
+        let mut new_file = File::create(file_path.clone()).unwrap();
+        let mut buf = Vec::new();
+        response.read_to_end(&mut buf);
+        new_file.write_all(&buf);
+    }
+
+    let c_url = CString::new(file_path.to_str().unwrap()).unwrap();
 
     unsafe {
         let schema_parser_ctxt = xmlSchemaNewParserCtxt(c_url.as_ptr());
