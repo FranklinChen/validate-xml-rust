@@ -24,7 +24,7 @@ Usage:
 Options:
   -h --help                Show this screen.
   --version                Show version.
-  --extension=<extension>  File extension of XML files [default: .cmdi].
+  --extension=<extension>  File extension of XML files [default: cmdi].
 ";
 
 #[derive(Debug, RustcDecodable)]
@@ -37,20 +37,19 @@ use std::env;
 use std::fs;
 use std::ffi::CString;
 use std::collections::HashMap;
-use std::io;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use regex::Regex;
 use parking_lot::RwLock;
-use walkdir::{DirEntry, WalkDir};
-use rayon::prelude::*;
+use walkdir::WalkDir;
 use hyper::Client;
 
 /// For libxml2 FFI.
 use libc::{c_char, c_int, c_uint, FILE};
 
+/// Fake opaque structs from C libxml2.
 pub enum XmlSchema {}
 pub enum XmlSchemaParserCtxt {}
 pub enum XmlSchemaValidCtxt {}
@@ -85,7 +84,8 @@ extern "C" {
 
 fn extract_schema_url(path: &Path) -> String {
     lazy_static! {
-        static ref RE: Regex = Regex::new(r#"xsi:schemaLocation="\S+\s+(.+?)""#).unwrap();
+        static ref RE: Regex = Regex::new(r#"xsi:schemaLocation="\S+\s+(.+?)""#)
+	    .expect("failed to compile schemaLocation regex");
     }
 
     let f = File::open(path).unwrap();
@@ -105,16 +105,18 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
 
         static ref SCHEMA_DIR: PathBuf = {
             let home_dir = env::home_dir().unwrap();
-            home_dir.as_path().join(".xmlschemas")
+            let result = home_dir.as_path().join(".xmlschemas");
+
+            fs::create_dir_all(result.as_path())
+                .expect("could not create .xmlschemas dir");
+            result
         };
     }
 
-    fs::create_dir(SCHEMA_DIR.as_path());
     let encoded_file_name = url.replace("/", "%2F");
     let file_path = SCHEMA_DIR.join(encoded_file_name);
-    //let file_path_str = file_path.to_str().unwrap();
 
-    if let Ok(attr) = fs::metadata(file_path.clone()) {
+    if let Ok(_) = fs::metadata(file_path.clone()) {
         // Already cached. (Hopefully not trash.)
     } else {
         // Synchronously download from Web to local file.
@@ -125,8 +127,8 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
         let mut response = CLIENT.get(url).send().unwrap();
         let mut new_file = File::create(file_path.clone()).unwrap();
         let mut buf = Vec::new();
-        response.read_to_end(&mut buf);
-        new_file.write_all(&buf);
+        response.read_to_end(&mut buf).expect("read_to_end failed");
+        new_file.write_all(&buf).expect("write_all failed");
     }
 
     let c_url = CString::new(file_path.to_str().unwrap()).unwrap();
@@ -167,8 +169,7 @@ fn get_schema(url: String) -> XmlSchemaPtr {
 }
 
 /// Copy the behavior of [`xmllint`](https://github.com/GNOME/libxml2/blob/master/xmllint.c)
-fn validate(e: &DirEntry) {
-    let path = e.path();
+fn validate(path: &Path) {
     let url = extract_schema_url(path);
     let schema = get_schema(url);
 
@@ -183,12 +184,12 @@ fn validate(e: &DirEntry) {
         //xmlSchemaSetValidErrors();
         let result = xmlSchemaValidateFile(schema_valid_ctxt, c_path.as_ptr(), 0);
         if result == 0 {
-            writeln!(std::io::stderr(), "{} validates", path_str);
+            writeln!(std::io::stderr(), "{} validates", path_str).unwrap();
         } else if result > 0 {
             // Note: the message is output after the validation messages.
-            writeln!(std::io::stderr(), "{} fails to validate", path_str);
+            writeln!(std::io::stderr(), "{} fails to validate", path_str).unwrap();
         } else {
-            writeln!(std::io::stderr(), "{} validation generated an internal error", path_str);
+            writeln!(std::io::stderr(), "{} validation generated an internal error", path_str).unwrap();
         }
 
         xmlSchemaFreeValidCtxt(schema_valid_ctxt);
@@ -199,21 +200,24 @@ fn main() {
     let args: Args = Docopt::new(USAGE)
         .and_then(|d| d.decode())
         .unwrap_or_else(|e| e.exit());
+    let extension_str = &(args.flag_extension);
+
     unsafe {
         xmlInitParser();
         xmlInitGlobals();
     }
 
-    let entries = WalkDir::new(&args.arg_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .map(|s| s.ends_with(&args.flag_extension))
-                        .unwrap_or(false)
-                })
-        .collect::<Vec<_>>();
-
-    &entries.par_iter().for_each(validate);
+    rayon::scope(|s| {
+        for entry in WalkDir::new(&args.arg_dir) {
+            s.spawn(move |_| {
+                let e = entry.unwrap();
+                let path = e.path();
+                if let Some(path_extension) = path.extension() {
+                    if path_extension.to_str().unwrap() == extension_str {
+                        validate(path);
+                    }
+                }
+            });
+        }
+    });
 }
