@@ -7,7 +7,7 @@ extern crate docopt;
 
 extern crate parking_lot;
 extern crate libc;
-extern crate walkdir;
+extern crate ignore;
 extern crate rayon;
 extern crate regex;
 
@@ -43,7 +43,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use regex::Regex;
 use parking_lot::RwLock;
-use walkdir::WalkDir;
+use ignore::Walk;
 use hyper::Client;
 
 /// For libxml2 FFI.
@@ -208,16 +208,18 @@ fn main() {
     }
 
     rayon::scope(|s| {
-        for entry in WalkDir::new(&args.arg_dir) {
-            s.spawn(move |_| {
-                let e = entry.unwrap();
-                let path = e.path();
-                if let Some(path_extension) = path.extension() {
-                    if path_extension.to_str().unwrap() == extension_str {
-                        validate(path);
+        for result in Walk::new(&args.arg_dir) {
+            if let Ok(entry) = result {
+                s.spawn(move |_| {
+                    // TODO I'm having trouble moving the spawn inward to just validate.
+                    let path = entry.path();
+                    if let Some(extension) = path.extension() {
+                        if extension.to_str().unwrap() == extension_str {
+                            validate(path);
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     });
 }
