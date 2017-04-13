@@ -104,28 +104,31 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
         static ref CLIENT: Client = Client::new();
 
         static ref SCHEMA_DIR: PathBuf = {
-            let home_dir = env::home_dir().unwrap();
-            let result = home_dir.as_path().join(".xmlschemas");
+            let home_dir = env::home_dir().expect("could not find home directory");
+            let schema_dir = home_dir.join(".xmlschemas");
 
-            fs::create_dir_all(result.as_path())
-                .expect("could not create .xmlschemas dir");
-            result
+            fs::create_dir_all(schema_dir.as_path())
+                .expect(&format!("could not create {}", schema_dir.display()));
+            schema_dir
         };
     }
 
     let encoded_file_name = url.replace("/", "%2F");
-    let file_path = SCHEMA_DIR.join(encoded_file_name);
+    let file_path_buf = SCHEMA_DIR.join(encoded_file_name);
+    let file_path = file_path_buf.as_path();
 
-    if let Ok(_) = fs::metadata(file_path.clone()) {
+    if file_path.is_file() {
         // Already cached. (Hopefully not trash.)
     } else {
         // Synchronously download from Web to local file.
+        // TODO Make async?
 
         // DEBUG to show that download happens only once.
         println!("Downloading now {}...", url);
 
         let mut response = CLIENT.get(url).send().unwrap();
-        let mut new_file = File::create(file_path.clone()).unwrap();
+        let mut new_file = File::create(file_path)
+            .expect(&format!("could not create cache file {}", file_path.display()));
         let mut buf = Vec::new();
         response.read_to_end(&mut buf).expect("read_to_end failed");
         new_file.write_all(&buf).expect("write_all failed");
@@ -135,7 +138,10 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
 
     unsafe {
         let schema_parser_ctxt = xmlSchemaNewParserCtxt(c_url.as_ptr());
+
+        // Use default callbacks rather than overriding.
         //xmlSchemaSetParserErrors();
+
         let schema = xmlSchemaParse(schema_parser_ctxt);
         xmlSchemaFreeParserCtxt(schema_parser_ctxt);
 
@@ -161,6 +167,7 @@ fn get_schema(url: String) -> XmlSchemaPtr {
         m.get(&url)
             .map(|&s| s)
             .unwrap_or_else(|| {
+                // TODO make async?
                 let schema = download_schema(&url);
                 m.insert(url, schema);
                 schema
@@ -207,19 +214,18 @@ fn main() {
         xmlInitGlobals();
     }
 
-    rayon::scope(|s| {
+    rayon::scope(|scope| {
         for result in Walk::new(&args.arg_dir) {
-            if let Ok(entry) = result {
-                s.spawn(move |_| {
-                    // TODO I'm having trouble moving the spawn inward to just validate.
+            scope.spawn(move |_| {
+                if let Ok(entry) = result {
                     let path = entry.path();
                     if let Some(extension) = path.extension() {
                         if extension.to_str().unwrap() == extension_str {
                             validate(path);
                         }
                     }
-                });
-            }
+                }
+            });
         }
     });
 }
