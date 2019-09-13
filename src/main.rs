@@ -1,17 +1,18 @@
 #[macro_use]
 extern crate lazy_static;
 
-extern crate hyper;
-extern crate rustc_serialize;
+extern crate dirs;
 extern crate docopt;
-
-extern crate parking_lot;
-extern crate libc;
 extern crate ignore;
+extern crate libc;
+extern crate parking_lot;
 extern crate rayon;
 extern crate regex;
+extern crate reqwest;
+extern crate serde;
 
 use docopt::Docopt;
+use serde::Deserialize;
 
 const USAGE: &'static str = "
 Validate XML files concurrently and downloading remote XML Schemas only once.
@@ -27,24 +28,23 @@ Options:
   --extension=<extension>  File extension of XML files [default: cmdi].
 ";
 
-#[derive(Debug, RustcDecodable)]
+#[derive(Deserialize)]
 struct Args {
     flag_extension: String,
     arg_dir: String,
 }
 
-use std::env;
-use std::fs;
-use std::ffi::CString;
-use std::collections::HashMap;
-use std::io::BufReader;
-use std::io::prelude::*;
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use regex::Regex;
-use parking_lot::RwLock;
 use ignore::Walk;
-use hyper::Client;
+use parking_lot::RwLock;
+use regex::Regex;
+use reqwest::Client;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 
 /// For libxml2 FFI.
 use libc::{c_char, c_int, c_uint, FILE};
@@ -76,16 +76,17 @@ extern "C" {
     pub fn xmlSchemaNewValidCtxt(schema: *const XmlSchema) -> *mut XmlSchemaValidCtxt;
     pub fn xmlSchemaFreeValidCtxt(ctxt: *mut XmlSchemaValidCtxt);
     //pub fn xmlSchemaSetValidErrors();
-    pub fn xmlSchemaValidateFile(ctxt: *const XmlSchemaValidCtxt,
-                                 file_name: *const c_char,
-                                 options: c_uint)
-                                 -> c_int;
+    pub fn xmlSchemaValidateFile(
+        ctxt: *const XmlSchemaValidCtxt,
+        file_name: *const c_char,
+        options: c_uint,
+    ) -> c_int;
 }
 
 fn extract_schema_url(path: &Path) -> String {
     lazy_static! {
         static ref RE: Regex = Regex::new(r#"xsi:schemaLocation="\S+\s+(.+?)""#)
-	    .expect("failed to compile schemaLocation regex");
+            .expect("failed to compile schemaLocation regex");
     }
 
     let f = File::open(path).unwrap();
@@ -97,14 +98,12 @@ fn extract_schema_url(path: &Path) -> String {
     unreachable!()
 }
 
-
 /// Cache into ~/.xmlschemas/ directory.
 fn download_schema(url: &str) -> XmlSchemaPtr {
     lazy_static! {
         static ref CLIENT: Client = Client::new();
-
         static ref SCHEMA_DIR: PathBuf = {
-            let home_dir = env::home_dir().expect("could not find home directory");
+            let home_dir = dirs::home_dir().expect("could not find home directory");
             let schema_dir = home_dir.join(".xmlschemas");
 
             fs::create_dir_all(schema_dir.as_path())
@@ -127,8 +126,10 @@ fn download_schema(url: &str) -> XmlSchemaPtr {
         println!("Downloading now {}...", url);
 
         let mut response = CLIENT.get(url).send().unwrap();
-        let mut new_file = File::create(file_path)
-            .expect(&format!("could not create cache file {}", file_path.display()));
+        let mut new_file = File::create(file_path).expect(&format!(
+            "could not create cache file {}",
+            file_path.display()
+        ));
         let mut buf = Vec::new();
         response.read_to_end(&mut buf).expect("read_to_end failed");
         new_file.write_all(&buf).expect("write_all failed");
@@ -164,14 +165,12 @@ fn get_schema(url: String) -> XmlSchemaPtr {
         let mut m = M.write();
 
         // Double-checked locking pattern.
-        m.get(&url)
-            .map(|&s| s)
-            .unwrap_or_else(|| {
-                // TODO make async?
-                let schema = download_schema(&url);
-                m.insert(url, schema);
-                schema
-            })
+        m.get(&url).map(|&s| s).unwrap_or_else(|| {
+            // TODO make async?
+            let schema = download_schema(&url);
+            m.insert(url, schema);
+            schema
+        })
     })
 }
 
@@ -196,7 +195,12 @@ fn validate(path: &Path) {
             // Note: the message is output after the validation messages.
             writeln!(std::io::stderr(), "{} fails to validate", path_str).unwrap();
         } else {
-            writeln!(std::io::stderr(), "{} validation generated an internal error", path_str).unwrap();
+            writeln!(
+                std::io::stderr(),
+                "{} validation generated an internal error",
+                path_str
+            )
+            .unwrap();
         }
 
         xmlSchemaFreeValidCtxt(schema_valid_ctxt);
@@ -205,7 +209,7 @@ fn validate(path: &Path) {
 
 fn main() {
     let args: Args = Docopt::new(USAGE)
-        .and_then(|d| d.decode())
+        .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
     let extension_str = &(args.flag_extension);
 

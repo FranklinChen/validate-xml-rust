@@ -46,7 +46,7 @@ Usage:
 Options:
   -h --help                Show this screen.
   --version                Show version.
-  --extension=<extension>  File extension of XML files [default: .cmdi].
+  --extension=<extension>  File extension of XML files [default: cmdi].
 ```
 
 ## Performance
