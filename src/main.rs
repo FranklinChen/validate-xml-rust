@@ -37,7 +37,7 @@ struct Args {
 use ignore::Walk;
 use parking_lot::RwLock;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
