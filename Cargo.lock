@@ -207,22 +207,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5827cebf4670468b8772dd191856768aedcb1b0278a04f989f7766351917b9dc"
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ec7fcd21571dc78f96cc96243cab8d8f035247c3efd16c687be154c3fa9efa"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b18cd2e169ad86297e6bc0ad9aa679aee9daa4f19e8163860faf7c164e4f5a71"
 dependencies = [
  "crossbeam-epoch",
- "crossbeam-utils",
+ "crossbeam-utils 0.6.6",
 ]
 
 [[package]]
@@ -233,7 +224,7 @@ checksum = "fedcd6772e37f3da2a9af9bf12ebe046c0dfe657992377b4df982a2b54cd37a9"
 dependencies = [
  "arrayvec",
  "cfg-if 0.1.9",
- "crossbeam-utils",
+ "crossbeam-utils 0.6.6",
  "lazy_static",
  "memoffset",
  "scopeguard",
@@ -245,7 +236,7 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c979cd6cfe72335896575c6b5688da489e420d36a27a0b9eb0c73db574b4a4b"
 dependencies = [
- "crossbeam-utils",
+ "crossbeam-utils 0.6.6",
 ]
 
 [[package]]
@@ -256,6 +247,16 @@ checksum = "04973fa96e96579258a5091af6003abde64af786b860f18622b82e026cca60e6"
 dependencies = [
  "cfg-if 0.1.9",
  "lazy_static",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51887d4adc7b564537b15adcfb307936f8075dfcd5f00dde9a9f1d29383682bc"
+dependencies = [
+ "cfg-if 1.0.0",
+ "once_cell",
 ]
 
 [[package]]
@@ -427,9 +428,9 @@ dependencies = [
 
 [[package]]
 name = "globset"
-version = "0.4.4"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "925aa2cac82d8834e2b2a4415b6f6879757fb5c0928fc445ae76461a12eed8f2"
+checksum = "0a1e17342619edbc21a964c2afbeb6c820c6a2560032872f397bb97ea127bd0a"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -547,18 +548,18 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.10"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec16832258409d571aaef8273f3c3cc5b060d784e159d1a0f3b0017308f84a7"
+checksum = "713f1b139373f96a2e0ce3ac931cd01ee973c3c5dd7c40c0c2efe96ad2b6751d"
 dependencies = [
- "crossbeam-channel",
+ "crossbeam-utils 0.8.11",
  "globset",
  "lazy_static",
  "log",
  "memchr",
  "regex",
  "same-file",
- "thread_local",
+ "thread_local 1.1.4",
  "walkdir",
  "winapi-util",
 ]
@@ -934,7 +935,7 @@ checksum = "98dcf634205083b17d0861252431eb2acbfb698ab7478a2d20de07954f47ec7b"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-queue",
- "crossbeam-utils",
+ "crossbeam-utils 0.6.6",
  "lazy_static",
  "num_cpus",
 ]
@@ -975,7 +976,7 @@ dependencies = [
  "aho-corasick",
  "memchr",
  "regex-syntax",
- "thread_local",
+ "thread_local 0.3.6",
 ]
 
 [[package]]
@@ -1038,7 +1039,7 @@ checksum = "4ca4eaef519b494d1f2848fc602d18816fed808a981aedf4f1f00ceb7c9d32cf"
 dependencies = [
  "base64 0.10.1",
  "blake2b_simd",
- "crossbeam-utils",
+ "crossbeam-utils 0.6.6",
 ]
 
 [[package]]
@@ -1266,6 +1267,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6b53e329000edc2b34dbe8545fd20e55a333362d0a321909685a19bd28c3f1b"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "thread_local"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5516c27b78311c50bf42c071425c560ac799b11c30b31f87e3081965fe5e0180"
+dependencies = [
+ "once_cell",
 ]
 
 [[package]]
