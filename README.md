@@ -19,7 +19,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ## Installation
 
 ```
-$ cargo install --force
+$ cargo install --path .
 ```
 
 will install `validate-xml` into `$HOME/.cargo/bin`.
