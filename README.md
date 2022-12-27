@@ -4,17 +4,7 @@
 
 ## Prerequisites
 
-Cargo for Rust is required. I recommend installing [`rustup`](https://www.rustup.rs/) with the instructions
-
-```
-$ curl https://sh.rustup.rs -sSf | sh
-```
-
-and then putting into your shell startup
-
-```
-export PATH="$HOME/.cargo/bin:$PATH"
-```
+Cargo for Rust is required.
 
 ## Installation
 
