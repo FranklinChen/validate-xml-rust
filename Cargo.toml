@@ -10,9 +10,8 @@ ignore = "*"
 regex = "*"
 lazy_static = "*"
 clap = "*"
-reqwest = "*"
+reqwest = { version = "*", features = ["blocking"] }
 dirs = "*"
 serde = "*"
 docopt = "*"
-cached = { version = "*", features = ["async_tokio_rt_multi_thread"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs"] }
+cached = "*"

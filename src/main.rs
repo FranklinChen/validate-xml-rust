@@ -1,15 +1,15 @@
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use tokio::io::{BufReader, AsyncBufReadExt};
-use tokio::task;
-use tokio::fs::File;
-use tokio::runtime::Handle;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::fs::File;
 use lazy_static::lazy_static;
 // TODO use clap
 use docopt::Docopt;
 use serde::Deserialize;
 use std::ffi::CString;
 use cached::proc_macro::cached;
+use reqwest::blocking::Client;
 
 /// For libxml2 FFI.
 use libc::{c_char, c_int, c_uint, FILE};
@@ -70,16 +70,16 @@ struct Args {
 
 /// Return the first Schema URL found, if any.
 /// Panic on any I/O error.
-async fn extract_schema_url(path: &Path) -> Option<String> {
+fn extract_schema_url(path: &Path) -> Option<String> {
     lazy_static! {
         static ref RE: Regex = Regex::new(r#"xsi:schemaLocation="\S+\s+(.+?)""#)
             .expect("failed to compile schemaLocation regex");
     }
 
-    let file = File::open(path).await.unwrap();
-    let mut lines = BufReader::new(file).lines();
-    while let Some(line) = lines.next_line().await.unwrap() {
-        if let Some(caps) = RE.captures(&line) {
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        if let Some(caps) = RE.captures(&line.unwrap()) {
             return Some(caps[1].to_owned());
         }
     }
@@ -90,15 +90,15 @@ async fn extract_schema_url(path: &Path) -> Option<String> {
 ///
 /// Panics on I/O error.
 #[cached(sync_writes = true)]
-async fn get_schema(url: String) -> XmlSchemaPtr {
+fn get_schema(url: String) -> XmlSchemaPtr {
     lazy_static! {
-        static ref CLIENT: reqwest::Client = reqwest::Client::new();
+        static ref CLIENT: Client = Client::new();
     }
 
     // DEBUG to show that download happens only once.
     println!("Downloading now {url}...");
 
-    let response = CLIENT.get(url.as_str()).send().await.unwrap().bytes().await.unwrap();
+    let response = CLIENT.get(url.as_str()).send().unwrap().bytes().unwrap();
 
     unsafe {
         let schema_parser_ctxt = xmlSchemaNewMemParserCtxt(response.as_ptr() as *const c_char,
@@ -115,9 +115,9 @@ async fn get_schema(url: String) -> XmlSchemaPtr {
 }
 
 /// Copy the behavior of [`xmllint`](https://github.com/GNOME/libxml2/blob/master/xmllint.c)
-async fn validate(path_buf: PathBuf) {
-    let url = extract_schema_url(path_buf.as_path()).await.unwrap();
-    let schema = get_schema(url).await;
+fn validate(path_buf: PathBuf) {
+    let url = extract_schema_url(path_buf.as_path()).unwrap();
+    let schema = get_schema(url);
 
     let path_str = path_buf.to_str().unwrap();
     let c_path = CString::new(path_str).unwrap();
@@ -146,8 +146,7 @@ async fn validate(path_buf: PathBuf) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Args = Docopt::new(USAGE)
         .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
@@ -164,11 +163,7 @@ async fn main() {
             let path = entry.path().to_owned();
             if let Some(extension) = path.extension() {
                 if extension.to_str().unwrap() == extension_str {
-                    task::block_in_place(move || {
-                        Handle::current().block_on(async move {
-                            validate(path).await;
-                        })
-                    })
+                    validate(path);
                 }
             }
         }
