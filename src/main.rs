@@ -1,15 +1,15 @@
+use lazy_static::lazy_static;
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
-use std::fs::File;
-use lazy_static::lazy_static;
+use std::path::{Path, PathBuf};
 // TODO use clap
+use cached::proc_macro::cached;
 use docopt::Docopt;
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::ffi::CString;
-use cached::proc_macro::cached;
-use reqwest::blocking::Client;
 
 /// For libxml2 FFI.
 use libc::{c_char, c_int, c_uint, FILE};
@@ -32,7 +32,10 @@ extern "C" {
     pub fn xmlInitGlobals();
 
     // xmlschemas
-    pub fn xmlSchemaNewMemParserCtxt(buffer: *const c_char, size: c_int) -> *mut XmlSchemaParserCtxt;
+    pub fn xmlSchemaNewMemParserCtxt(
+        buffer: *const c_char,
+        size: c_int,
+    ) -> *mut XmlSchemaParserCtxt;
     //pub fn xmlSchemaSetParserErrors();
     pub fn xmlSchemaParse(ctxt: *const XmlSchemaParserCtxt) -> *mut XmlSchema;
     pub fn xmlSchemaFreeParserCtxt(ctxt: *mut XmlSchemaParserCtxt);
@@ -101,8 +104,8 @@ fn get_schema(url: String) -> XmlSchemaPtr {
     let response = CLIENT.get(url.as_str()).send().unwrap().bytes().unwrap();
 
     unsafe {
-        let schema_parser_ctxt = xmlSchemaNewMemParserCtxt(response.as_ptr() as *const c_char,
-                                                           response.len() as i32);
+        let schema_parser_ctxt =
+            xmlSchemaNewMemParserCtxt(response.as_ptr() as *const c_char, response.len() as i32);
 
         // Use default callbacks rather than overriding.
         //xmlSchemaSetParserErrors();
@@ -137,9 +140,7 @@ fn validate(path_buf: PathBuf) {
             // Note: the message is output after the validation messages.
             eprintln!("{path_str} fails to validate");
         } else {
-            eprintln!(
-                "{path_str} validation generated an internal error"
-            );
+            eprintln!("{path_str} validation generated an internal error");
         }
 
         xmlSchemaFreeValidCtxt(schema_valid_ctxt);
@@ -158,14 +159,18 @@ fn main() {
     }
 
     // No real point in using WalkParallel.
-    for result in ignore::Walk::new(&args.arg_dir) {
-        if let Ok(entry) = result {
-            let path = entry.path().to_owned();
-            if let Some(extension) = path.extension() {
-                if extension.to_str().unwrap() == extension_str {
-                    validate(path);
+    rayon::scope(|scope| {
+        for result in ignore::Walk::new(&args.arg_dir) {
+            scope.spawn(move |_| {
+                if let Ok(entry) = result {
+                    let path = entry.path().to_owned();
+                    if let Some(extension) = path.extension() {
+                        if extension.to_str().unwrap() == extension_str {
+                            validate(path);
+                        }
+                    }
                 }
-            }
+            });
         }
-    }
+    });
 }
