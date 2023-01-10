@@ -1,10 +1,10 @@
 # Validate XML against XML Schema using Rust
 
-[![Build Status](https://travis-ci.org/FranklinChen/validate-xml-rust.png)](https://travis-ci.org/FranklinChen/validate-xml-rust)
-
 ## Prerequisites
 
 Cargo for Rust is required.
+
+`libxml2` needs to be installed.
 
 ## Installation
 
@@ -45,7 +45,7 @@ This was written to be super fast:
 
 - Concurrency, using number of cores available.
 - Use of C FFI with `libxml2` library.
-- Downloading of remote XML Schema files only once, and caching to `~/.xmlschemas/` for future runs of the program.
+- Downloading of remote XML Schema files only once per run, and caching to memory.
 - Caching of `libxml2` schema data structure for reuse in multiple concurrent parses.
 
 On my machine, it takes a few seconds to validate a sample set of 20,000 XML files. This is hundreds of times faster than the first attempt, which was a shell script that sequentially runs `xmllint` (after first pre-downloading remote XML Schema files and passing the local files to `xmllint` with `--schema`). The concurrency is a big win, as is the reuse of the `libxml2` schema data structure across threads and avoiding having to spawn `xmllint` as a heavyweight process.
