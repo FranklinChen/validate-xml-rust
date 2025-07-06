@@ -52,7 +52,7 @@ extern "C" {
 }
 
 const USAGE: &str = "
-Validate XML files concurrently and downloading remote XML Schemas only once.
+Validate XML files concurrently and loading XML Schemas (remote or local) only once.
 
 Usage:
   validate-xml [--extension=<extension>] <dir>
@@ -89,23 +89,33 @@ fn extract_schema_url(path: &Path) -> Option<String> {
     None
 }
 
-/// Cache schema into memory after downloading from Web once and stashing into memory.
+/// Cache schema into memory after downloading from Web or reading from local file once and stashing into memory.
 ///
 /// Panics on I/O error.
 #[cached(sync_writes = true)]
 fn get_schema(url: String) -> XmlSchemaPtr {
-    lazy_static! {
-        static ref CLIENT: Client = Client::new();
-    }
-
-    // DEBUG to show that download happens only once.
-    println!("Downloading now {url}...");
-
-    let response = CLIENT.get(url.as_str()).send().unwrap().bytes().unwrap();
+    let schema_data = if url.starts_with("http://") || url.starts_with("https://") {
+        // Handle remote URL
+        lazy_static! {
+            static ref CLIENT: Client = Client::new();
+        }
+        
+        // DEBUG to show that download happens only once.
+        println!("Downloading schema from {url}...");
+        
+        CLIENT.get(url.as_str()).send().unwrap().bytes().unwrap()
+    } else {
+        // Handle local file path
+        println!("Reading schema from local file {url}...");
+        
+        std::fs::read(&url).unwrap_or_else(|e| {
+            panic!("Failed to read schema file '{url}': {e}");
+        }).into()
+    };
 
     unsafe {
         let schema_parser_ctxt =
-            xmlSchemaNewMemParserCtxt(response.as_ptr() as *const c_char, response.len() as i32);
+            xmlSchemaNewMemParserCtxt(schema_data.as_ptr() as *const c_char, schema_data.len() as i32);
 
         // Use default callbacks rather than overriding.
         //xmlSchemaSetParserErrors();
