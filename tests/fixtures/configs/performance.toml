@@ -1,0 +1,13 @@
+[validation]
+extensions = ["xml"]
+threads = 8
+
+[cache]
+directory = "/tmp/xml-validator-perf-cache"
+ttl_hours = 168  # 1 week
+max_size_mb = 500
+
+[network]
+timeout_seconds = 60
+retry_attempts = 5
+retry_delay_ms = 500

@@ -1,0 +1,18 @@
+[validation]
+extensions = ["xml", "cmdi"]
+threads = 4
+
+[cache]
+directory = "/tmp/xml-validator-cache"
+ttl_hours = 24
+max_size_mb = 100
+
+[network]
+timeout_seconds = 30
+retry_attempts = 3
+retry_delay_ms = 1000
+
+[output]
+format = "summary"
+verbose = false
+quiet = false

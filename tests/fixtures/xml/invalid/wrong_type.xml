@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="../schemas/local/complex.xsd"
+          version="not_a_number">
+    <header>
+        <title>Test Document</title>
+        <author>Test Author</author>
+        <date>invalid-date</date>
+    </header>
+    <body>
+        <section id="intro">
+            <title>Introduction</title>
+            <content>This is the introduction section.</content>
+        </section>
+    </body>
+</document>
