@@ -47,18 +47,24 @@
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 
 use libc::{FILE, c_char, c_int, c_uint};
+use once_cell::sync::Lazy;
 
 use crate::error::{LibXml2Error, LibXml2Result};
 
 /// Global initialization flag for libxml2
-///
-/// This ensures that libxml2's parser and globals are initialized exactly once,
-/// in a thread-safe manner. libxml2's initialization functions are NOT thread-safe,
-/// so we must use std::sync::Once to protect them.
 static LIBXML2_INIT: Once = Once::new();
+
+/// Global lock for serializing non-thread-safe libxml2 operations.
+///
+/// While validation is thread-safe, the following are NOT:
+/// - Library initialization (xmlInitParser, xmlInitGlobals)
+/// - Schema parsing (xmlSchemaParse)
+///
+/// We use this lock to ensure these operations happen sequentially across all threads.
+static LIBXML2_GLOBAL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// ## Thread Safety Strategy
 ///
@@ -350,9 +356,12 @@ impl LibXml2Wrapper {
     /// of libxml2, which has non-thread-safe initialization functions.
     pub fn new() -> Self {
         // Initialize libxml2 exactly once, in a thread-safe manner
-        LIBXML2_INIT.call_once(|| unsafe {
-            xmlInitParser();
-            xmlInitGlobals();
+        LIBXML2_INIT.call_once(|| {
+            let _lock = LIBXML2_GLOBAL_LOCK.lock().unwrap();
+            unsafe {
+                xmlInitParser();
+                xmlInitGlobals();
+            }
         });
 
         LibXml2Wrapper {
@@ -363,8 +372,7 @@ impl LibXml2Wrapper {
     /// Parse an XML schema from memory buffer
     ///
     /// **IMPORTANT**: Schema parsing is NOT thread-safe in libxml2.
-    /// This function should NOT be called concurrently from multiple threads.
-    /// In practice, schemas are cached and parsed only once, so this is not an issue.
+    /// This function uses a global lock to ensure serialization.
     ///
     /// # Arguments
     ///
@@ -373,12 +381,10 @@ impl LibXml2Wrapper {
     /// # Returns
     ///
     /// A `XmlSchemaPtr` that can be used for validation, or an error if parsing fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns `LibXml2Error::SchemaParseFailed` if the schema cannot be parsed.
-    /// Returns `LibXml2Error::MemoryAllocation` if memory allocation fails.
     pub fn parse_schema_from_memory(&self, schema_data: &[u8]) -> LibXml2Result<XmlSchemaPtr> {
+        // Serialize schema parsing as it's not thread-safe in libxml2
+        let _lock = LIBXML2_GLOBAL_LOCK.lock().unwrap();
+
         unsafe {
             // Create parser context from memory buffer
             let parser_ctxt = xmlSchemaNewMemParserCtxt(
@@ -703,26 +709,19 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_initialization() {
-        // Test that concurrent LibXml2Wrapper creation is thread-safe
-        // This specifically tests the LIBXML2_INIT Once protection
+    fn test_concurrent_parsing_and_initialization() {
+        // Test that concurrent LibXml2Wrapper creation and parsing is thread-safe
+        // thanks to the new global lock.
+        use rayon::prelude::*;
 
-        // NOTE: Schema PARSING is NOT thread-safe in libxml2, so we parse sequentially
-        // Only validation is thread-safe
-
-        // Create wrappers and parse schemas SEQUENTIALLY
-        let mut results = Vec::new();
-        for _ in 0..5 {
+        (0..20).into_par_iter().for_each(|_| {
             let wrapper = LibXml2Wrapper::new();
             let schema_data = SIMPLE_XSD.as_bytes();
-            results.push(wrapper.parse_schema_from_memory(schema_data));
-        }
-
-        // All should succeed
-        for result in results {
-            assert!(result.is_ok(), "Schema parsing should succeed");
+            let result = wrapper.parse_schema_from_memory(schema_data);
+            
+            assert!(result.is_ok(), "Concurrent schema parsing should succeed");
             assert!(result.unwrap().is_valid());
-        }
+        });
     }
 
     #[test]

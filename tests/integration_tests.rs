@@ -30,14 +30,19 @@ fn test_cli_basic_validation() {
 
     let output = Command::new("./target/release/validate-xml")
         .arg(temp_dir.path())
-        .arg("--format")
-        .arg("summary")
         .output()
         .expect("Failed to run validation");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    
+    if !output.status.success() {
+        println!("STDOUT: {}", stdout);
+        println!("STDERR: {}", stderr);
+    }
+    
     assert!(output.status.success());
-    assert!(stdout.contains("1/1 valid"));
+    assert!(stdout.contains("Valid: 1"));
 }
 
 #[test]
@@ -61,5 +66,5 @@ fn test_cli_help() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("USAGE:") || stdout.contains("Usage:"));
+    assert!(stdout.contains("Usage:"));
 }

@@ -35,8 +35,22 @@ Before marking any task as "done", you **MUST** run and pass:
 ## Implementation Details
 
 ### Thread Safety (Critical)
-*   **Parsing (`xmlSchemaParse`)**: NOT thread-safe. Serialized via `ParsedSchemaCache`.
-*   **Validation (`xmlSchemaValidateFile`)**: IS thread-safe. Runs in parallel.
+
+Our architecture handles `libxml2`'s legacy global state through a hybrid strategy:
+
+*   **Serialized Operations**: Library initialization (`xmlInitParser`) and schema parsing (`xmlSchemaParse`) are **NOT** thread-safe. These are protected by a global `Mutex` (`LIBXML2_GLOBAL_LOCK`) in `src/libxml2.rs`.
+*   **Parallel Operations**: Schema validation (`xmlSchemaValidateFile`) **IS** thread-safe and runs in parallel across all CPU cores without locks.
+*   **Thundering Herd Protection**: `ParsedSchemaCache` (moka) ensures each unique XSD is parsed exactly once, even under heavy concurrent load.
+
+### Platform Support
+
+The project supports macOS, Linux, and Windows:
+
+*   **Windows**: Uses `vcpkg` for `libxml2`. Linking is directed to `libxml2.lib`.
+*   **Unix (macOS/Linux)**: Uses system libraries. Linking is directed to `libxml2` (usually `libxml2.so` or `libxml2.dylib`).
+*   **FFI Linking**: Handled via `#[cfg_attr]` in `src/libxml2.rs` to ensure correct library resolution at compile time.
 
 ### FFI Wrappers (`src/libxml2.rs`)
+
 *   **Safety**: Wrap raw pointers in `XmlSchemaPtr` (RAII) immediately to prevent leaks/segfaults.
+*   **Locking**: All non-thread-safe FFI calls MUST be wrapped in the global mutex.

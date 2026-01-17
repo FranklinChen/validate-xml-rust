@@ -26,7 +26,7 @@ impl Output {
 
     fn colorize(&self, text: &str, color: &str) -> String {
         if self.show_colors {
-            format!("\x1b[{}m{}\\\x1b[0m", color, text)
+            format!("\x1b[{}m{}\x1b[0m", color, text)
         } else {
             text.to_string()
         }

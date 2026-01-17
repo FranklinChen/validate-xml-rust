@@ -41,6 +41,7 @@ A blazingly fast CLI tool for validating XML files against XML Schemas, built in
   - macOS: `brew install libxml2`
   - Ubuntu/Debian: `sudo apt-get install libxml2-dev`
   - CentOS/RHEL: `sudo yum install libxml2-devel`
+  - Windows: `vcpkg install libxml2:x64-windows`
 
 ---
 
@@ -162,7 +163,7 @@ The validator consists of four main components:
 **3. Concurrent Validation**
 - Spawns async tasks bounded by `--threads`.
 - Heavy CPU tasks (parsing, validation) are offloaded to `spawn_blocking`.
-- **True Parallelism**: No global locks - validations run in parallel across CPU cores.
+- **Thread Safety**: Uses a global lock for non-thread-safe library initialization and schema parsing, while allowing **full parallel execution** for XML validation.
 
 **4. Error Reporting**
 - Aggregates and formats errors with line/column information.
