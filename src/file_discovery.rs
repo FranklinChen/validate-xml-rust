@@ -1,5 +1,5 @@
 use crate::error::{Result, ValidationError};
-use regex::Regex;
+use globset::{GlobSet, GlobSetBuilder};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -8,10 +8,10 @@ use tokio::fs;
 pub struct FileDiscovery {
     /// File extensions to include (e.g., ["xml", "xsd"])
     extensions: Vec<String>,
-    /// Include patterns (glob-style patterns)
-    include_patterns: Vec<Regex>,
-    /// Exclude patterns (glob-style patterns)
-    exclude_patterns: Vec<Regex>,
+    /// Include patterns set
+    include_set: Option<GlobSet>,
+    /// Exclude patterns set
+    exclude_set: Option<GlobSet>,
     /// Maximum depth for directory traversal (None = unlimited)
     max_depth: Option<usize>,
     /// Follow symbolic links
@@ -23,8 +23,8 @@ impl FileDiscovery {
     pub fn new() -> Self {
         Self {
             extensions: vec!["xml".to_string()],
-            include_patterns: Vec::new(),
-            exclude_patterns: Vec::new(),
+            include_set: None,
+            exclude_set: None,
             max_depth: None,
             follow_symlinks: false,
         }
@@ -36,21 +36,45 @@ impl FileDiscovery {
         self
     }
 
-    /// Add include patterns (converted from glob to regex)
+    /// Add include patterns
     pub fn with_include_patterns(mut self, patterns: Vec<String>) -> Result<Self> {
-        self.include_patterns = patterns
-            .into_iter()
-            .map(|pattern| glob_to_regex(&pattern))
-            .collect::<Result<Vec<_>>>()?;
+        if patterns.is_empty() {
+            self.include_set = None;
+            return Ok(self);
+        }
+
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = globset::GlobBuilder::new(&pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+            builder.add(glob);
+        }
+        
+        self.include_set = Some(builder.build()
+            .map_err(|e| ValidationError::Config(format!("Failed to build include glob set: {}", e)))?);
         Ok(self)
     }
 
-    /// Add exclude patterns (converted from glob to regex)
+    /// Add exclude patterns
     pub fn with_exclude_patterns(mut self, patterns: Vec<String>) -> Result<Self> {
-        self.exclude_patterns = patterns
-            .into_iter()
-            .map(|pattern| glob_to_regex(&pattern))
-            .collect::<Result<Vec<_>>>()?;
+        if patterns.is_empty() {
+            self.exclude_set = None;
+            return Ok(self);
+        }
+
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = globset::GlobBuilder::new(&pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+            builder.add(glob);
+        }
+        
+        self.exclude_set = Some(builder.build()
+            .map_err(|e| ValidationError::Config(format!("Failed to build exclude glob set: {}", e)))?);
         Ok(self)
     }
 
@@ -175,23 +199,16 @@ impl FileDiscovery {
             return false;
         }
 
-        let path_str = path.to_string_lossy();
-
         // Check exclude patterns first
-        for exclude_pattern in &self.exclude_patterns {
-            if exclude_pattern.is_match(&path_str) {
+        if let Some(exclude_set) = &self.exclude_set {
+            if exclude_set.is_match(path) {
                 return false;
             }
         }
 
         // Check include patterns (if any are specified, at least one must match)
-        if !self.include_patterns.is_empty() {
-            for include_pattern in &self.include_patterns {
-                if include_pattern.is_match(&path_str) {
-                    return true;
-                }
-            }
-            return false;
+        if let Some(include_set) = &self.include_set {
+            return include_set.is_match(path);
         }
 
         true
@@ -218,66 +235,6 @@ impl Default for FileDiscovery {
 pub struct DiscoveryStats {
     pub files_found: usize,
     pub errors: usize,
-}
-
-/// Convert glob pattern to regex
-fn glob_to_regex(pattern: &str) -> Result<Regex> {
-    let mut regex_pattern = String::new();
-    let mut chars = pattern.chars().peekable();
-
-    regex_pattern.push('^');
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '*' => {
-                if chars.peek() == Some(&'*') {
-                    chars.next(); // consume second *
-                    if chars.peek() == Some(&'/') {
-                        chars.next(); // consume /
-                        regex_pattern.push_str("(?:.*/)?");
-                    } else {
-                        regex_pattern.push_str(".*");
-                    }
-                } else {
-                    regex_pattern.push_str("[^/]*");
-                }
-            }
-            '?' => regex_pattern.push_str("[^/]"),
-            '[' => {
-                regex_pattern.push('[');
-                while let Some(ch) = chars.next() {
-                    if ch == ']' {
-                        regex_pattern.push(']');
-                        break;
-                    }
-                    if ch == '\\' {
-                        regex_pattern.push('\\');
-                        if let Some(escaped) = chars.next() {
-                            regex_pattern.push(escaped);
-                        }
-                    } else {
-                        regex_pattern.push(ch);
-                    }
-                }
-            }
-            '\\' => {
-                regex_pattern.push('\\');
-                if let Some(escaped) = chars.next() {
-                    regex_pattern.push(escaped);
-                }
-            }
-            '.' | '^' | '$' | '(' | ')' | '{' | '}' | '+' | '|' => {
-                regex_pattern.push('\\');
-                regex_pattern.push(ch);
-            }
-            _ => regex_pattern.push(ch),
-        }
-    }
-
-    regex_pattern.push('$');
-
-    Regex::new(&regex_pattern)
-        .map_err(|e| ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e)))
 }
 
 #[cfg(test)]
@@ -456,33 +413,6 @@ mod tests {
         assert!(file_names.contains("file2.xml"));
         assert!(file_names.contains("nested.xml"));
         assert!(file_names.contains("deep.xml"));
-    }
-
-    #[test]
-    fn test_glob_to_regex() {
-        // Test basic patterns
-        let regex = glob_to_regex("*.xml").unwrap();
-        assert!(regex.is_match("test.xml"));
-        assert!(!regex.is_match("test.txt"));
-        assert!(!regex.is_match("dir/test.xml")); // * doesn't match /
-
-        // Test recursive patterns
-        let regex = glob_to_regex("**/*.xml").unwrap();
-        assert!(regex.is_match("test.xml"));
-        assert!(regex.is_match("dir/test.xml"));
-        assert!(regex.is_match("dir/subdir/test.xml"));
-
-        // Test question mark
-        let regex = glob_to_regex("test?.xml").unwrap();
-        assert!(regex.is_match("test1.xml"));
-        assert!(regex.is_match("testa.xml"));
-        assert!(!regex.is_match("test12.xml"));
-
-        // Test character classes
-        let regex = glob_to_regex("test[0-9].xml").unwrap();
-        assert!(regex.is_match("test1.xml"));
-        assert!(regex.is_match("test9.xml"));
-        assert!(!regex.is_match("testa.xml"));
     }
 
     #[tokio::test]
