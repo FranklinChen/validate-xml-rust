@@ -25,9 +25,11 @@ jobs:
             libxml2_install: brew install libxml2
           - os: windows-latest
             libxml2_install: |
-              choco install libxml2
-              echo "LIBXML2_LIB_DIR=C:\tools\libxml2\lib" >> $GITHUB_ENV
-              echo "LIBXML2_INCLUDE_DIR=C:\tools\libxml2\include" >> $GITHUB_ENV
+              vcpkg install libxml2:x64-windows
+              $vcpkg_root = $env:VCPKG_INSTALLATION_ROOT
+              echo "LIB=$vcpkg_root\installed\x64-windows\lib;$env:LIB" >> $env:GITHUB_ENV
+              echo "INCLUDE=$vcpkg_root\installed\x64-windows\include;$env:INCLUDE" >> $env:GITHUB_ENV
+              echo "PATH=$vcpkg_root\installed\x64-windows\bin;$env:PATH" >> $env:GITHUB_ENV
 
     steps:
     - name: Checkout code

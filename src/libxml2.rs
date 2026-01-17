@@ -113,7 +113,8 @@ pub struct XmlSchemaValidCtxt {
 }
 
 // External libxml2 FFI declarations
-#[link(name = "xml2")]
+#[cfg_attr(target_os = "windows", link(name = "libxml2"))]
+#[cfg_attr(not(target_os = "windows"), link(name = "xml2"))]
 unsafe extern "C" {
     pub fn xmlInitParser();
     pub fn xmlInitGlobals();
