@@ -718,7 +718,7 @@ mod tests {
             let wrapper = LibXml2Wrapper::new();
             let schema_data = SIMPLE_XSD.as_bytes();
             let result = wrapper.parse_schema_from_memory(schema_data);
-            
+
             assert!(result.is_ok(), "Concurrent schema parsing should succeed");
             assert!(result.unwrap().is_valid());
         });

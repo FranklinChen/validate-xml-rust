@@ -35,12 +35,12 @@ fn test_cli_basic_validation() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    
+
     if !output.status.success() {
         println!("STDOUT: {}", stdout);
         println!("STDERR: {}", stderr);
     }
-    
+
     assert!(output.status.success());
     assert!(stdout.contains("Valid: 1"));
 }
