@@ -1,0 +1,57 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            libxml2_install: sudo apt-get update && sudo apt-get install -y libxml2-dev
+          - os: macos-latest
+            libxml2_install: brew install libxml2
+          - os: windows-latest
+            libxml2_install: |
+              choco install libxml2
+              echo "LIBXML2_LIB_DIR=C:\tools\libxml2\lib" >> $GITHUB_ENV
+              echo "LIBXML2_INCLUDE_DIR=C:\tools\libxml2\include" >> $GITHUB_ENV
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache Rust dependencies and build artifacts
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install libxml2
+      run: ${{ matrix.libxml2_install }}
+
+    - name: Build
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test
+
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Check formatting
+      run: cargo fmt --check

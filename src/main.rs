@@ -1,176 +1,122 @@
-use lazy_static::lazy_static;
-use regex::Regex;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
-// TODO use clap
-use cached::proc_macro::cached;
-use docopt::Docopt;
-use reqwest::blocking::Client;
-use serde::Deserialize;
-use std::ffi::CString;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::Arc;
+use std::time::Duration;
 
-/// For libxml2 FFI.
-use libc::{c_char, c_int, c_uint, FILE};
+use validate_xml::*;
 
-/// Fake opaque structs from C libxml2.
-pub enum XmlSchema {}
-pub enum XmlSchemaParserCtxt {}
-pub enum XmlSchemaValidCtxt {}
+#[tokio::main]
+async fn main() -> Result<(), ValidationError> {
+    let cli = Cli::parse_args();
 
-/// We know that libxml2 schema data structure is [thread-safe](http://xmlsoft.org/threads.hml).
-#[derive(Clone, Copy)]
-struct XmlSchemaPtr(pub *mut XmlSchema);
-
-unsafe impl Send for XmlSchemaPtr {}
-unsafe impl Sync for XmlSchemaPtr {}
-
-#[link(name = "xml2")]
-extern "C" {
-    pub fn xmlInitParser();
-    pub fn xmlInitGlobals();
-
-    // xmlschemas
-    pub fn xmlSchemaNewMemParserCtxt(
-        buffer: *const c_char,
-        size: c_int,
-    ) -> *mut XmlSchemaParserCtxt;
-    //pub fn xmlSchemaSetParserErrors();
-    pub fn xmlSchemaParse(ctxt: *const XmlSchemaParserCtxt) -> *mut XmlSchema;
-    pub fn xmlSchemaFreeParserCtxt(ctxt: *mut XmlSchemaParserCtxt);
-    pub fn xmlSchemaDump(output: *mut FILE, schema: *const XmlSchema);
-    pub fn xmlSchemaFree(schema: *mut XmlSchema);
-    pub fn xmlSchemaNewValidCtxt(schema: *const XmlSchema) -> *mut XmlSchemaValidCtxt;
-    pub fn xmlSchemaFreeValidCtxt(ctxt: *mut XmlSchemaValidCtxt);
-    //pub fn xmlSchemaSetValidErrors();
-    pub fn xmlSchemaValidateFile(
-        ctxt: *const XmlSchemaValidCtxt,
-        file_name: *const c_char,
-        options: c_uint,
-    ) -> c_int;
-}
-
-const USAGE: &str = "
-Validate XML files concurrently and downloading remote XML Schemas only once.
-
-Usage:
-  validate-xml [--extension=<extension>] <dir>
-  validate-xml (-h | --help)
-  validate-xml --version
-
-Options:
-  -h --help                Show this screen.
-  --version                Show version.
-  --extension=<extension>  File extension of XML files [default: cmdi].
-";
-
-#[derive(Deserialize)]
-struct Args {
-    flag_extension: String,
-    arg_dir: String,
-}
-
-/// Return the first Schema URL found, if any.
-/// Panic on any I/O error.
-fn extract_schema_url(path: &Path) -> Option<String> {
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r#"xsi:schemaLocation="\S+\s+(.+?)""#)
-            .expect("failed to compile schemaLocation regex");
+    if let Err(error) = cli.validate() {
+        eprintln!("Error: {}", error);
+        std::process::exit(1);
     }
 
-    let file = File::open(path).unwrap();
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        if let Some(caps) = RE.captures(&line.unwrap()) {
-            return Some(caps[1].to_owned());
-        }
-    }
-    None
-}
+    let config = Config::from_cli(&cli);
+    let _libxml2_wrapper = LibXml2Wrapper::new();
 
-/// Cache schema into memory after downloading from Web once and stashing into memory.
-///
-/// Panics on I/O error.
-#[cached(sync_writes = true)]
-fn get_schema(url: String) -> XmlSchemaPtr {
-    lazy_static! {
-        static ref CLIENT: Client = Client::new();
+    if config.verbose && !config.quiet {
+        println!("XML Validator");
+        println!("Configuration:");
+        println!("  Path: {}", config.path.display());
+        println!("  Extensions: {:?}", config.extensions);
+        println!("  Threads: {}", config.threads);
+        println!("  Cache directory: {}", config.cache_dir.display());
+        println!("  Timeout: {} seconds", config.timeout_seconds);
     }
 
-    // DEBUG to show that download happens only once.
-    println!("Downloading now {url}...");
+    let schema_cache = Arc::new(SchemaCache::new(CacheConfig {
+        directory: config.cache_dir.clone(),
+        ttl_hours: config.cache_ttl_hours,
+        max_size_mb: config.max_cache_size_mb,
+        max_memory_entries: 1000,
+        memory_ttl_seconds: 3600,
+    }));
 
-    let response = CLIENT.get(url.as_str()).send().unwrap().bytes().unwrap();
+    let http_client = AsyncHttpClient::new(HttpClientConfig {
+        timeout_seconds: config.timeout_seconds,
+        retry_attempts: config.retry_attempts,
+        retry_delay_ms: 1000,
+        max_retry_delay_ms: 30000,
+        user_agent: format!("validate-xml/{}", env!("CARGO_PKG_VERSION")),
+    })?;
 
-    unsafe {
-        let schema_parser_ctxt =
-            xmlSchemaNewMemParserCtxt(response.as_ptr() as *const c_char, response.len() as i32);
+    let validation_engine = ValidationEngine::new(
+        schema_cache,
+        http_client,
+        ValidationConfig {
+            max_concurrent_validations: config.threads,
+            validation_timeout: Duration::from_secs(config.timeout_seconds),
+            fail_fast: config.fail_fast,
+            show_progress: config.progress,
+            collect_metrics: true,
+        },
+    )?;
 
-        // Use default callbacks rather than overriding.
-        //xmlSchemaSetParserErrors();
+    let file_discovery = FileDiscovery::new().with_extensions(config.extensions.clone());
+    let file_discovery = file_discovery.with_include_patterns(config.include_patterns.clone())?;
+    let file_discovery = file_discovery.with_exclude_patterns(config.exclude_patterns.clone())?;
 
-        let schema = xmlSchemaParse(schema_parser_ctxt);
-        xmlSchemaFreeParserCtxt(schema_parser_ctxt);
-
-        XmlSchemaPtr(schema)
-    }
-}
-
-/// Copy the behavior of [`xmllint`](https://github.com/GNOME/libxml2/blob/master/xmllint.c)
-fn validate(path_buf: PathBuf) {
-    let url = extract_schema_url(path_buf.as_path()).unwrap();
-    let schema = get_schema(url);
-
-    let path_str = path_buf.to_str().unwrap();
-    let c_path = CString::new(path_str).unwrap();
-
-    unsafe {
-        // Have to create new validation context for each parse.
-        let schema_valid_ctxt = xmlSchemaNewValidCtxt(schema.0);
-
-        // TODO better error message with integrated path using callback.
-        //xmlSchemaSetValidErrors();
-
-        // This reads the file and validates it.
-        let result = xmlSchemaValidateFile(schema_valid_ctxt, c_path.as_ptr(), 0);
-        if result == 0 {
-            eprintln!("{path_str} validates");
-        } else if result > 0 {
-            // Note: the message is output after the validation messages.
-            eprintln!("{path_str} fails to validate");
-        } else {
-            eprintln!("{path_str} validation generated an internal error");
-        }
-
-        xmlSchemaFreeValidCtxt(schema_valid_ctxt);
-    }
-}
-
-fn main() {
-    let args: Args = Docopt::new(USAGE)
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
-    let extension_str = &(args.flag_extension);
-
-    unsafe {
-        xmlInitParser();
-        xmlInitGlobals();
+    if !config.quiet {
+        println!("Scanning: {}", config.path.display());
     }
 
-    // No real point in using WalkParallel.
-    rayon::scope(|scope| {
-        for result in ignore::Walk::new(&args.arg_dir) {
-            scope.spawn(move |_| {
-                if let Ok(entry) = result {
-                    let path = entry.path().to_owned();
-                    if let Some(extension) = path.extension() {
-                        if extension.to_str().unwrap() == extension_str {
-                            validate(path);
-                        }
-                    }
+    let pb = if config.progress && !config.quiet {
+        let pb = ProgressBar::new(0);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .expect("Invalid progress bar template")
+            .progress_chars("█░"));
+        Some(pb)
+    } else {
+        None
+    };
+
+    let pb_clone = pb.clone();
+    let progress_callback = pb_clone.map(|pb| {
+        Arc::new(move |progress: ValidationProgress| match progress.phase {
+            ValidationPhase::Discovery => {
+                pb.set_message("Discovering files...");
+            }
+            ValidationPhase::SchemaLoading => {
+                pb.set_message("Loading schemas...");
+            }
+            ValidationPhase::Validation => {
+                if pb.length() == Some(0) && progress.total > 0 {
+                    pb.set_length(progress.total as u64);
                 }
-            });
-        }
+                pb.set_position(progress.completed as u64);
+                if let Some(file) = progress.current_file {
+                    let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    pb.set_message(format!("Validating: {}", filename));
+                }
+            }
+            ValidationPhase::Aggregation => {
+                pb.set_message("Finalizing...");
+            }
+            ValidationPhase::Complete => {
+                pb.finish_and_clear();
+            }
+        }) as ProgressCallback
     });
+
+    let results = validation_engine
+        .run_comprehensive_validation(&config.path, &file_discovery, progress_callback)
+        .await?;
+
+    if !config.quiet {
+        let output_formatter = Output::new(config.verbosity());
+        println!("{}", output_formatter.format_results(&results));
+    }
+
+    if results.has_errors() && config.fail_fast {
+        std::process::exit(1);
+    } else if results.error_files > 0 {
+        std::process::exit(2);
+    } else if results.invalid_files > 0 {
+        std::process::exit(3);
+    }
+
+    Ok(())
 }

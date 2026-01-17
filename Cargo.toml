@@ -1,18 +1,58 @@
 [package]
 name = "validate-xml"
-version = "0.1.0"
+version = "0.2.1"
 authors = ["Franklin Chen <franklinchen@franklinchen.com>"]
-edition = "2021"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "validate-xml"
+path = "src/main.rs"
 
 [dependencies]
-libc = "*"
-ignore = "*"
-regex = "*"
-lazy_static = "*"
-clap = "*"
-reqwest = { version = "*", features = ["blocking"] }
-dirs = "*"
-serde = "*"
-docopt = "*"
-cached = "*"
-rayon = "*"
+# Core system dependencies
+libc = "0.2"
+
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# Caching (moka for memory, cacache for disk persistence)
+moka = { version = "0.12", features = ["future"] }
+cacache = { version = "13.1", features = ["tokio", "futures", "tokio-stream"], default-features = false }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["fs"] }
+
+# HTTP client (fully async)
+reqwest = { version = "0.13", features = ["json", "stream"] }
+
+# Error handling
+thiserror = "2.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Regular expressions
+regex = "1.12"
+
+# Progress reporting
+indicatif = "0.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+dirs = "6.0"
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1.17"
+atty = "0.2"
+
+[dev-dependencies]
+# Testing dependencies
+tempfile = "3.24"
+rayon = "1.11"
+divan = "0.1.21"
+
+[[bench]]
+name = "xml_benchmark"
+harness = false
