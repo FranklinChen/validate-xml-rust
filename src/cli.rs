@@ -70,6 +70,9 @@ impl Config {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "validate-xml")]
 #[command(about = "Validate XML files against their schemas with high performance and caching")]
+#[command(long_about = "Validate XML files against their schemas with high performance and caching.\n\n\
+Note: When an XML file references multiple schemas via xsi:schemaLocation, only the \
+first schema URL is used for validation. Multiple schema validation is not currently supported.")]
 #[command(version)]
 pub struct Cli {
     /// Path to scan for XML files (directory or file)

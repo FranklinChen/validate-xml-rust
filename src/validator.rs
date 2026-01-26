@@ -758,14 +758,19 @@ impl ValidationEngine {
 
     /// Collect cache statistics for performance metrics
     async fn collect_cache_statistics(&self) -> Result<SchemaCacheStats> {
-        // Try to get statistics from the schema loader's cache
-        // This is a placeholder - actual implementation depends on cache interface
-        Ok(SchemaCacheStats {
-            hits: 0,
-            misses: 0,
-            schemas_loaded: 0,
-            cache_size_bytes: 0,
-        })
+        // Get statistics from the schema loader's cache
+        let cache = self.schema_loader.cache();
+        match cache.stats().await {
+            Ok(stats) => Ok(SchemaCacheStats {
+                // Note: moka cache doesn't track hits/misses directly,
+                // so we report the entry counts as a proxy for loaded schemas
+                hits: 0,
+                misses: 0,
+                schemas_loaded: stats.memory.entry_count as usize,
+                cache_size_bytes: stats.disk.total_size,
+            }),
+            Err(_) => Ok(SchemaCacheStats::default()),
+        }
     }
 
     /// Get peak memory usage in MB

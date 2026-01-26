@@ -60,7 +60,7 @@ static LIBXML2_INIT: Once = Once::new();
 /// Global lock for serializing non-thread-safe libxml2 operations.
 ///
 /// While validation is thread-safe, the following are NOT:
-/// - Library initialization (xmlInitParser, xmlInitGlobals)
+/// - Library initialization (xmlInitParser)
 /// - Schema parsing (xmlSchemaParse)
 ///
 /// We use this lock to ensure these operations happen sequentially across all threads.
@@ -123,7 +123,6 @@ pub struct XmlSchemaValidCtxt {
 #[cfg_attr(not(target_os = "windows"), link(name = "xml2"))]
 unsafe extern "C" {
     pub fn xmlInitParser();
-    pub fn xmlInitGlobals();
     pub fn xmlCleanupParser();
 
     // Schema parsing functions
@@ -359,8 +358,9 @@ impl LibXml2Wrapper {
         LIBXML2_INIT.call_once(|| {
             let _lock = LIBXML2_GLOBAL_LOCK.lock().unwrap();
             unsafe {
+                // Note: xmlInitGlobals() was deprecated in libxml2 2.9.0 and removed in 2.12.0
+                // xmlInitParser() handles all necessary initialization
                 xmlInitParser();
-                xmlInitGlobals();
             }
         });
 
