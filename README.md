@@ -76,6 +76,15 @@ validate-xml --extensions xml,xsd /path/to/files
 validate-xml --verbose /path/to/files
 ```
 
+### Schema Override
+
+Validate XML files against a specific XSD schema, even if the XML files don't contain `xsi:schemaLocation` attributes:
+
+```bash
+# Validate using an explicit schema file
+validate-xml --schema /path/to/schema.xsd /path/to/xml/files
+```
+
 ### Output Formats
 
 Standard output includes validation status per file (in verbose mode) and a final summary.
@@ -131,6 +140,7 @@ validate-xml [OPTIONS] <DIRECTORY>
 | `--verbose` | - | Show detailed output |
 | `--quiet` | - | Suppress non-error output |
 | `--progress` | Auto | Show progress bar |
+| `--schema <PATH>` | - | Validate against a specific XSD (overrides schema references in XML) |
 | `--fail-fast` | - | Stop validation on first error |
 | `--help` | - | Show help message |
 | `--version` | - | Show version information |

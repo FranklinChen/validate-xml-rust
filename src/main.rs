@@ -51,6 +51,7 @@ async fn main() -> Result<(), ValidationError> {
             fail_fast: config.fail_fast,
             show_progress: config.progress,
             collect_metrics: true,
+            schema_override: config.schema.clone(),
         },
     )?;
 

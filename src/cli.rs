@@ -33,6 +33,7 @@ pub struct Config {
     pub progress: bool,
     pub fail_fast: bool,
     pub max_cache_size_mb: u64,
+    pub schema: Option<PathBuf>,
 }
 
 impl Config {
@@ -52,6 +53,7 @@ impl Config {
             progress: cli.progress || (atty::is(atty::Stream::Stderr) && !cli.quiet),
             fail_fast: cli.fail_fast,
             max_cache_size_mb: cli.max_cache_size,
+            schema: cli.schema.clone(),
         }
     }
 
@@ -70,9 +72,11 @@ impl Config {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "validate-xml")]
 #[command(about = "Validate XML files against their schemas with high performance and caching")]
-#[command(long_about = "Validate XML files against their schemas with high performance and caching.\n\n\
+#[command(
+    long_about = "Validate XML files against their schemas with high performance and caching.\n\n\
 Note: When an XML file references multiple schemas via xsi:schemaLocation, only the \
-first schema URL is used for validation. Multiple schema validation is not currently supported.")]
+first schema URL is used for validation. Multiple schema validation is not currently supported."
+)]
 #[command(version)]
 pub struct Cli {
     /// Path to scan for XML files (directory or file)
@@ -144,6 +148,10 @@ pub struct Cli {
     /// Maximum cache size in MB
     #[arg(long = "max-cache-size", default_value = "100")]
     pub max_cache_size: u64,
+
+    /// Path to an XSD schema file to validate against (overrides schema references in XML files)
+    #[arg(long = "schema", value_name = "PATH")]
+    pub schema: Option<PathBuf>,
 }
 
 impl Cli {
@@ -168,6 +176,10 @@ impl Cli {
         {
             return Err("Number of threads must be greater than 0".to_string());
         }
+        if let Some(ref schema) = self.schema
+            && !schema.exists() {
+                return Err(format!("Schema file does not exist: {}", schema.display()));
+            }
         Ok(())
     }
 
@@ -198,5 +210,19 @@ mod tests {
         let args = vec!["validate-xml", "/tmp"];
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.path, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn test_schema_flag_parsing() {
+        let args = vec!["validate-xml", "/tmp", "--schema", "/path/to/schema.xsd"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.schema, Some(PathBuf::from("/path/to/schema.xsd")));
+    }
+
+    #[test]
+    fn test_schema_flag_default_none() {
+        let args = vec!["validate-xml", "/tmp"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.schema, None);
     }
 }

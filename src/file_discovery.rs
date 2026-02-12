@@ -48,12 +48,15 @@ impl FileDiscovery {
             let glob = globset::GlobBuilder::new(&pattern)
                 .literal_separator(true)
                 .build()
-                .map_err(|e| ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+                .map_err(|e| {
+                    ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e))
+                })?;
             builder.add(glob);
         }
-        
-        self.include_set = Some(builder.build()
-            .map_err(|e| ValidationError::Config(format!("Failed to build include glob set: {}", e)))?);
+
+        self.include_set = Some(builder.build().map_err(|e| {
+            ValidationError::Config(format!("Failed to build include glob set: {}", e))
+        })?);
         Ok(self)
     }
 
@@ -69,12 +72,15 @@ impl FileDiscovery {
             let glob = globset::GlobBuilder::new(&pattern)
                 .literal_separator(true)
                 .build()
-                .map_err(|e| ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+                .map_err(|e| {
+                    ValidationError::Config(format!("Invalid glob pattern '{}': {}", pattern, e))
+                })?;
             builder.add(glob);
         }
-        
-        self.exclude_set = Some(builder.build()
-            .map_err(|e| ValidationError::Config(format!("Failed to build exclude glob set: {}", e)))?);
+
+        self.exclude_set = Some(builder.build().map_err(|e| {
+            ValidationError::Config(format!("Failed to build exclude glob set: {}", e))
+        })?);
         Ok(self)
     }
 
@@ -200,11 +206,10 @@ impl FileDiscovery {
         }
 
         // Check exclude patterns first
-        if let Some(exclude_set) = &self.exclude_set {
-            if exclude_set.is_match(path) {
+        if let Some(exclude_set) = &self.exclude_set
+            && exclude_set.is_match(path) {
                 return false;
             }
-        }
 
         // Check include patterns (if any are specified, at least one must match)
         if let Some(include_set) = &self.include_set {

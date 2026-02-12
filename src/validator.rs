@@ -37,6 +37,8 @@ pub struct ValidationConfig {
     pub show_progress: bool,
     /// Collect performance metrics
     pub collect_metrics: bool,
+    /// Override schema path (skip schema extraction from XML)
+    pub schema_override: Option<PathBuf>,
 }
 
 impl Default for ValidationConfig {
@@ -47,6 +49,7 @@ impl Default for ValidationConfig {
             fail_fast: false,
             show_progress: false,
             collect_metrics: true,
+            schema_override: None,
         }
     }
 }
@@ -548,6 +551,7 @@ impl ValidationEngine {
                 let timeout = self.config.validation_timeout;
                 let progress_callback = progress_callback.clone();
                 let completed = Arc::clone(&completed);
+                let schema_override = self.config.schema_override.clone();
 
                 tokio::spawn(async move {
                     // Acquire semaphore permit to limit concurrency
@@ -564,6 +568,7 @@ impl ValidationEngine {
                             file_path.clone(),
                             schema_loader,
                             libxml2_wrapper,
+                            schema_override,
                         ),
                     )
                     .await;
@@ -618,34 +623,42 @@ impl ValidationEngine {
         file_path: PathBuf,
         schema_loader: Arc<SchemaLoader>,
         libxml2_wrapper: Arc<LibXml2Wrapper>,
+        schema_override: Option<PathBuf>,
     ) -> FileValidationResult {
         let start_time = Instant::now();
 
-        // RE-IMPLEMENTATION with correct scope capture
-        // We need to resolve the reference first.
-        let schema_ref = match schema_loader
-            .extractor()
-            .extract_schema_urls(&file_path)
-            .await
-        {
-            Ok(refs) => match refs.into_iter().next() {
-                Some(r) => r,
-                None => {
+        // Use schema override if provided, otherwise extract from XML
+        let schema_ref = if let Some(schema_path) = schema_override {
+            let url = schema_path.display().to_string();
+            crate::schema_loader::SchemaReference {
+                url,
+                source_type: crate::schema_loader::SchemaSourceType::Local(schema_path),
+            }
+        } else {
+            match schema_loader
+                .extractor()
+                .extract_schema_urls(&file_path)
+                .await
+            {
+                Ok(refs) => match refs.into_iter().next() {
+                    Some(r) => r,
+                    None => {
+                        return FileValidationResult::skipped(
+                            file_path,
+                            "No schema URL found in XML file".to_string(),
+                            start_time.elapsed(),
+                        );
+                    }
+                },
+                Err(ValidationError::SchemaUrlNotFound { .. }) => {
                     return FileValidationResult::skipped(
                         file_path,
                         "No schema URL found in XML file".to_string(),
                         start_time.elapsed(),
                     );
                 }
-            },
-            Err(ValidationError::SchemaUrlNotFound { .. }) => {
-                return FileValidationResult::skipped(
-                    file_path,
-                    "No schema URL found in XML file".to_string(),
-                    start_time.elapsed(),
-                );
+                Err(e) => return FileValidationResult::error(file_path, e, start_time.elapsed()),
             }
-            Err(e) => return FileValidationResult::error(file_path, e, start_time.elapsed()),
         };
 
         let target_url = schema_ref.url.clone();
@@ -735,6 +748,7 @@ impl ValidationEngine {
             file_path.to_path_buf(),
             Arc::clone(&self.schema_loader),
             Arc::clone(&self.libxml2_wrapper),
+            self.config.schema_override.clone(),
         )
         .await;
 
@@ -842,6 +856,7 @@ mod tests {
             fail_fast: false,
             show_progress: false,
             collect_metrics: true,
+            schema_override: None,
         };
 
         let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
@@ -1168,6 +1183,7 @@ mod tests {
             fail_fast: false,
             show_progress: false,
             collect_metrics: true,
+            schema_override: None,
         };
 
         let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
@@ -1231,5 +1247,66 @@ mod tests {
         let config = engine.config();
 
         assert_eq!(config.max_concurrent_validations, 2);
+    }
+
+    #[tokio::test]
+    async fn test_validate_with_schema_override() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a simple schema file
+        let schema_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:element name="root">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="element" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+</xs:schema>"#;
+
+        let schema_file = temp_dir.path().join("schema.xsd");
+        tokio::fs::write(&schema_file, schema_content)
+            .await
+            .unwrap();
+
+        // Create XML file WITHOUT any schema reference
+        let xml_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<root>
+    <element>content</element>
+</root>"#;
+        let xml_file = create_test_xml_file(xml_content);
+
+        // Create engine with schema_override
+        let cache_config = CacheConfig {
+            directory: temp_dir.path().join("cache"),
+            ttl_hours: 1,
+            max_size_mb: 100,
+            max_memory_entries: 100,
+            memory_ttl_seconds: 300,
+        };
+        let cache = Arc::new(SchemaCache::new(cache_config));
+        let http_config = HttpClientConfig::default();
+        let http_client = AsyncHttpClient::new(http_config).unwrap();
+        let validation_config = ValidationConfig {
+            max_concurrent_validations: 2,
+            validation_timeout: Duration::from_secs(5),
+            fail_fast: false,
+            show_progress: false,
+            collect_metrics: true,
+            schema_override: Some(schema_file.clone()),
+        };
+
+        let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
+
+        let result = engine.validate_single_file(xml_file.path()).await.unwrap();
+
+        // Should be valid — the override schema was used instead of extracting from XML
+        assert!(
+            result.status.is_valid(),
+            "Expected valid result with schema override, got: {:?}",
+            result
+        );
+        assert_eq!(result.schema_url, Some(schema_file.display().to_string()));
     }
 }
