@@ -37,9 +37,6 @@ pub enum ValidationError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("LibXML2 internal error: {details}")]
-    LibXml2Internal { details: String },
-
     #[error("File system traversal error: {path} - {reason}")]
     FileSystemTraversal { path: PathBuf, reason: String },
 
@@ -123,31 +120,6 @@ pub enum NetworkError {
     TlsError { url: String, details: String },
 }
 
-/// LibXML2-specific error types
-#[derive(Error, Debug, Clone)]
-pub enum LibXml2Error {
-    #[error("Schema parsing failed: null pointer returned")]
-    SchemaParseFailed,
-
-    #[error("Validation context creation failed")]
-    ValidationContextFailed,
-
-    #[error("Validation context creation failed")]
-    ValidationContextCreationFailed,
-
-    #[error("File validation failed with code {code}: {file}")]
-    ValidationFailed { code: i32, file: PathBuf },
-
-    #[error("Memory allocation failed in libxml2")]
-    MemoryAllocation,
-
-    #[error("Invalid XML structure: {details}")]
-    InvalidXml { details: String },
-
-    #[error("Schema validation internal error: {details}")]
-    InternalError { details: String },
-}
-
 // Manual From implementations to handle Arc wrapping
 impl From<std::io::Error> for ValidationError {
     fn from(err: std::io::Error) -> Self {
@@ -181,32 +153,11 @@ impl From<NetworkError> for ValidationError {
     }
 }
 
-impl From<LibXml2Error> for ValidationError {
-    fn from(err: LibXml2Error) -> Self {
-        ValidationError::LibXml2Internal {
-            details: err.to_string(),
-        }
-    }
-}
-
 /// Result type alias for convenience
 pub type Result<T> = std::result::Result<T, ValidationError>;
 
-/// Configuration result type alias
-#[allow(dead_code)]
-pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
-
 /// Cache result type alias
-#[allow(dead_code)]
 pub type CacheResult<T> = std::result::Result<T, CacheError>;
-
-/// Network result type alias
-#[allow(dead_code)]
-pub type NetworkResult<T> = std::result::Result<T, NetworkError>;
-
-/// LibXML2 result type alias
-#[allow(dead_code)]
-pub type LibXml2Result<T> = std::result::Result<T, LibXml2Error>;
 
 #[cfg(test)]
 mod tests {
@@ -252,14 +203,6 @@ mod tests {
         };
         let validation_error: ValidationError = config_error.into();
         assert!(matches!(validation_error, ValidationError::Config(_)));
-
-        // Test LibXml2 conversion
-        let libxml2_error = LibXml2Error::SchemaParseFailed;
-        let validation_error: ValidationError = libxml2_error.into();
-        assert!(matches!(
-            validation_error,
-            ValidationError::LibXml2Internal { .. }
-        ));
     }
 
     #[test]

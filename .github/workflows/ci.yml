@@ -18,18 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        include:
-          - os: ubuntu-latest
-            libxml2_install: sudo apt-get update && sudo apt-get install -y libxml2-dev
-          - os: macos-latest
-            libxml2_install: brew install libxml2
-          - os: windows-latest
-            libxml2_install: |
-              vcpkg install libxml2:x64-windows
-              $vcpkg_root = $env:VCPKG_INSTALLATION_ROOT
-              echo "LIB=$vcpkg_root\installed\x64-windows\lib;$env:LIB" >> $env:GITHUB_ENV
-              echo "INCLUDE=$vcpkg_root\installed\x64-windows\include;$env:INCLUDE" >> $env:GITHUB_ENV
-              echo "PATH=$vcpkg_root\installed\x64-windows\bin;$env:PATH" >> $env:GITHUB_ENV
 
     steps:
     - name: Checkout code
@@ -40,9 +28,6 @@ jobs:
 
     - name: Cache Rust dependencies and build artifacts
       uses: Swatinem/rust-cache@v2
-
-    - name: Install libxml2
-      run: ${{ matrix.libxml2_install }}
 
     - name: Build
       run: cargo build --release

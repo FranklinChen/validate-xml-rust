@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::error::ValidationError;
-use crate::libxml2::XmlSchemaPtr;
+use xmloxide::validation::xsd::XsdSchema;
 
 /// Cache configuration
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -28,13 +28,13 @@ pub struct CacheConfig {
 /// Result type for cache operations
 pub type CacheResult<T> = Result<T, ValidationError>;
 
-/// In-memory cache for parsed libxml2 schema pointers
+/// In-memory cache for parsed XML schema objects
 ///
 /// This cache stores the actual compiled schema structures ready for validation.
 /// It uses `moka` to handle concurrent access and "thundering herd" protection
 /// (ensuring a schema is only parsed once even if multiple files request it simultaneously).
 pub struct ParsedSchemaCache {
-    cache: Cache<String, Arc<XmlSchemaPtr>>,
+    cache: Cache<String, Arc<XsdSchema>>,
 }
 
 impl ParsedSchemaCache {
@@ -52,10 +52,10 @@ impl ParsedSchemaCache {
         &self,
         key: String,
         loader: F,
-    ) -> Result<Arc<XmlSchemaPtr>, E>
+    ) -> Result<Arc<XsdSchema>, E>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Arc<XmlSchemaPtr>, E>>,
+        Fut: std::future::Future<Output = Result<Arc<XsdSchema>, E>>,
         E: Send + Sync + Clone + 'static, // Error type must be thread-safe and Clone
         ValidationError: From<E>,         // Allow conversion to ValidationError if needed
     {
@@ -65,7 +65,7 @@ impl ParsedSchemaCache {
             .map_err(|e| (*e).clone()) // Unwrap the Arc<E> from moka
     }
 
-    pub async fn get(&self, key: &str) -> Option<Arc<XmlSchemaPtr>> {
+    pub async fn get(&self, key: &str) -> Option<Arc<XsdSchema>> {
         self.cache.get(key).await
     }
 }
@@ -138,13 +138,11 @@ impl CachedSchema {
 /// Disk cache implementation using cacache for persistent, corruption-resistant storage
 pub struct DiskCache {
     cache_dir: PathBuf,
-    #[allow(dead_code)]
-    ttl: Duration,
 }
 
 impl DiskCache {
-    pub fn new(cache_dir: PathBuf, ttl: Duration) -> Self {
-        Self { cache_dir, ttl }
+    pub fn new(cache_dir: PathBuf) -> Self {
+        Self { cache_dir }
     }
 
     /// Generate a cache key from a URL
@@ -384,10 +382,7 @@ impl SchemaCache {
             Duration::from_secs(config.memory_ttl_seconds),
         );
 
-        let disk_cache = DiskCache::new(
-            config.directory.clone(),
-            Duration::from_secs(config.ttl_hours * 3600),
-        );
+        let disk_cache = DiskCache::new(config.directory.clone());
 
         // Limit parsed schemas to max_memory_entries (same as raw memory cache)
         let parsed_cache = ParsedSchemaCache::new(config.max_memory_entries);
@@ -596,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn test_disk_cache_basic_operations() {
         let (config, _temp_dir) = create_test_config();
-        let cache = DiskCache::new(config.directory.clone(), Duration::from_secs(3600));
+        let cache = DiskCache::new(config.directory.clone());
 
         let key = "test_key";
         let url = "https://example.com/schema.xsd";
@@ -624,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn test_disk_cache_expiration() {
         let (config, _temp_dir) = create_test_config();
-        let cache = DiskCache::new(config.directory.clone(), Duration::from_millis(100));
+        let cache = DiskCache::new(config.directory.clone());
 
         let key = "test_key";
         let url = "https://example.com/schema.xsd";

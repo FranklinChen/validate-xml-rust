@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/FranklinChen/validate-xml-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/FranklinChen/validate-xml-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.70+](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.81+](https://img.shields.io/badge/rust-1.81+-orange.svg)](https://www.rust-lang.org)
 
 A blazingly fast CLI tool for validating XML files against XML Schemas, built in Rust with a focus on concurrent processing, intelligent caching, and low memory overhead.
 
@@ -20,13 +20,13 @@ A blazingly fast CLI tool for validating XML files against XML Schemas, built in
 - **Smart Error Reporting**: Line/column numbers, clear error messages, detailed diagnostics
 
 ⚡ **Performance**
-- **C FFI**: Direct bindings to libxml2 for native XML/XSD validation
+- **Pure Rust**: Uses xmloxide for XML/XSD validation — no system dependencies or unsafe code
 - **Async I/O**: Tokio-based async operations for files and HTTP downloads
 - **In-Memory Caching**: First-run download + cross-run disk cache for schema reuse
 - **Bounded Memory**: Concurrent validation with configurable limits
 
 🏗️ **Architecture**
-- **Hybrid Async/Sync**: Async I/O (files, HTTP, caching) + sync CPU-bound validation (libxml2)
+- **Hybrid Async/Sync**: Async I/O (files, HTTP, caching) + sync CPU-bound validation (xmloxide)
 - **True Parallel Validation**: No global locks - 10x throughput on multi-core CPUs
 - **Parse Once, Validate Many**: Schemas are parsed once and shared safely across threads
 - **Modular Design**: Clean separation of concerns (discovery, loading, validation, reporting)
@@ -36,12 +36,7 @@ A blazingly fast CLI tool for validating XML files against XML Schemas, built in
 
 ## Prerequisites
 
-- **Rust**: 1.70+ (stable toolchain) with Cargo
-- **libxml2**: System library for XML validation
-  - macOS: `brew install libxml2`
-  - Ubuntu/Debian: `sudo apt-get install libxml2-dev`
-  - CentOS/RHEL: `sudo yum install libxml2-devel`
-  - Windows: `vcpkg install libxml2:x64-windows`
+- **Rust**: 1.81+ (stable toolchain) with Cargo
 
 ---
 
@@ -173,14 +168,14 @@ The validator consists of four main components:
 **3. Concurrent Validation**
 - Spawns async tasks bounded by `--threads`.
 - Heavy CPU tasks (parsing, validation) are offloaded to `spawn_blocking`.
-- **Thread Safety**: Uses a global lock for non-thread-safe library initialization and schema parsing, while allowing **full parallel execution** for XML validation.
+- **Thread Safety**: xmloxide is fully thread-safe — no global locks needed. Full parallel execution for XML validation.
 
 **4. Error Reporting**
 - Aggregates and formats errors with line/column information.
 
 ### Caching Strategy
 
-- **L1 Parsed Cache**: In-memory `moka` cache storing compiled `XmlSchemaPtr`. Ensures we parse any XSD exactly once.
+- **L1 Parsed Cache**: In-memory `moka` cache storing compiled `XsdSchema`. Ensures we parse any XSD exactly once.
 - **L2 Raw Cache**: Disk-backed `cacache` for persistent cross-run storage of schema bytes.
 
 ---

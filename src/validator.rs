@@ -2,12 +2,12 @@
 //!
 //! This module provides a high-performance validation engine using a hybrid architecture:
 //! - **Async I/O**: File discovery, schema loading, HTTP downloads, and caching
-//! - **Sync CPU-bound work**: libxml2 validation (thread-safe, no spawn_blocking overhead)
+//! - **Sync CPU-bound work**: XML validation (thread-safe, no spawn_blocking overhead)
 //! - **Concurrent orchestration**: tokio::spawn creates parallel validation tasks
 //! - **Bounded concurrency**: Semaphore limits prevent resource exhaustion
 //!
 //! The hybrid design maximizes throughput by avoiding spawn_blocking for CPU-bound
-//! libxml2 operations, enabling true parallel validation across multiple cores.
+//! XML validation operations, enabling true parallel validation across multiple cores.
 
 use futures::future::try_join_all;
 use std::path::{Path, PathBuf};
@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use xmloxide::tree::Document;
+use xmloxide::validation::xsd::{XsdSchema, parse_xsd, validate_xsd};
+
 use crate::cache::SchemaCache;
 use crate::error::{Result, ValidationError};
 use crate::file_discovery::FileDiscovery;
 use crate::http_client::AsyncHttpClient;
-use crate::libxml2::{LibXml2Wrapper, ValidationResult};
 use crate::schema_loader::SchemaLoader;
 
 /// Validation configuration
@@ -86,20 +88,6 @@ impl ValidationStatus {
     /// Check if the file was skipped
     pub fn is_skipped(&self) -> bool {
         matches!(self, ValidationStatus::Skipped { .. })
-    }
-}
-
-impl From<ValidationResult> for ValidationStatus {
-    fn from(result: ValidationResult) -> Self {
-        match result {
-            ValidationResult::Valid => ValidationStatus::Valid,
-            ValidationResult::Invalid { error_count, .. } => {
-                ValidationStatus::Invalid { error_count }
-            }
-            ValidationResult::InternalError { code } => ValidationStatus::Error {
-                message: format!("LibXML2 internal error: {}", code),
-            },
-        }
     }
 }
 
@@ -371,14 +359,13 @@ pub type ProgressCallback = Arc<dyn Fn(ValidationProgress) + Send + Sync>;
 ///
 /// Orchestrates validation using a hybrid architecture:
 /// - **Async operations**: File discovery, schema loading/caching, HTTP downloads
-/// - **Sync operations**: libxml2 validation (CPU-bound, thread-safe, runs directly in tokio tasks)
+/// - **Sync operations**: XML validation (CPU-bound, thread-safe, runs directly in tokio tasks)
 /// - **Concurrency**: Semaphore-bounded tokio::spawn tasks for parallel validation
 /// - **Result aggregation**: futures::try_join_all collects all validation results
 ///
 /// This design enables true parallel validation across CPU cores without spawn_blocking overhead.
 pub struct ValidationEngine {
     schema_loader: Arc<SchemaLoader>,
-    libxml2_wrapper: Arc<LibXml2Wrapper>,
     config: ValidationConfig,
 }
 
@@ -390,11 +377,9 @@ impl ValidationEngine {
         config: ValidationConfig,
     ) -> Result<Self> {
         let schema_loader = Arc::new(SchemaLoader::new(schema_cache, http_client)?);
-        let libxml2_wrapper = Arc::new(LibXml2Wrapper::new());
 
         Ok(Self {
             schema_loader,
-            libxml2_wrapper,
             config,
         })
     }
@@ -546,7 +531,6 @@ impl ValidationEngine {
             .into_iter()
             .map(|file_path| {
                 let schema_loader = Arc::clone(&self.schema_loader);
-                let libxml2_wrapper = Arc::clone(&self.libxml2_wrapper);
                 let semaphore = Arc::clone(&semaphore);
                 let timeout = self.config.validation_timeout;
                 let progress_callback = progress_callback.clone();
@@ -567,7 +551,6 @@ impl ValidationEngine {
                         Self::validate_single_file_internal(
                             file_path.clone(),
                             schema_loader,
-                            libxml2_wrapper,
                             schema_override,
                         ),
                     )
@@ -622,7 +605,6 @@ impl ValidationEngine {
     async fn validate_single_file_internal(
         file_path: PathBuf,
         schema_loader: Arc<SchemaLoader>,
-        libxml2_wrapper: Arc<LibXml2Wrapper>,
         schema_override: Option<PathBuf>,
     ) -> FileValidationResult {
         let start_time = Instant::now();
@@ -663,75 +645,81 @@ impl ValidationEngine {
 
         let target_url = schema_ref.url.clone();
         let loader_clone = schema_loader.clone();
-        let wrapper_clone = libxml2_wrapper.clone();
 
-        let schema_ptr = match schema_loader
+        let schema = match schema_loader
             .cache()
             .parsed()
             .get_or_load(target_url.clone(), || async move {
-                // 1. Load Bytes (Async)
                 let cached_bytes = loader_clone.load_schema(&schema_ref).await?;
 
-                // 2. Parse Bytes (Blocking)
-                // Libxml2 parsing is CPU intensive and blocking.
-                // We MUST offload this to a blocking thread to avoid starving the async runtime.
+                // Parse schema on a blocking thread (CPU-intensive for large schemas)
                 let data = cached_bytes.data.clone();
-                let wrapper = wrapper_clone;
+                let parsed: XsdSchema =
+                    tokio::task::spawn_blocking(move || {
+                        let schema_str =
+                            std::str::from_utf8(&data).map_err(|e| ValidationError::SchemaParsing {
+                                url: String::new(),
+                                details: format!("Schema is not valid UTF-8: {}", e),
+                            })?;
+                        parse_xsd(schema_str).map_err(|e| ValidationError::SchemaParsing {
+                            url: String::new(),
+                            details: e.message,
+                        })
+                    })
+                    .await
+                    .map_err(|e| ValidationError::Concurrency {
+                        details: e.to_string(),
+                    })??;
 
-                let ptr =
-                    tokio::task::spawn_blocking(move || wrapper.parse_schema_from_memory(&data))
-                        .await
-                        .map_err(|e| ValidationError::Concurrency {
-                            details: e.to_string(),
-                        })??;
-
-                Ok(Arc::new(ptr))
+                Ok(Arc::new(parsed))
             })
             .await
         {
-            Ok(ptr) => ptr,
+            Ok(s) => s,
             Err(e) => return FileValidationResult::error(file_path, e, start_time.elapsed()),
         };
 
-        // Step 3: Validate File (Blocking)
-        // Validation is also CPU intensive and blocking.
-        // While libxml2 uses the file system, it blocks the thread.
-        // Offloading this allows the async runtime to process other I/O events (like downloads).
-        let validate_wrapper = libxml2_wrapper.clone();
+        // Validate file on a blocking thread (file I/O blocks)
         let validate_path = file_path.clone();
-        let validate_ptr = schema_ptr; // Arc clone is cheap
+        let validate_schema = schema;
 
         let validation_result = tokio::task::spawn_blocking(move || {
-            validate_wrapper.validate_file(&validate_ptr, &validate_path)
+            let doc = Document::parse_file(&validate_path).map_err(|e| {
+                ValidationError::ValidationFailed {
+                    file: validate_path.clone(),
+                    details: e.to_string(),
+                }
+            })?;
+            Ok::<_, ValidationError>(validate_xsd(&doc, &validate_schema))
         })
         .await;
 
         let duration = start_time.elapsed();
 
         match validation_result {
-            Ok(Ok(result)) => match result {
-                ValidationResult::Valid => {
+            Ok(Ok(result)) => {
+                if result.is_valid {
                     FileValidationResult::valid(file_path, target_url, duration)
+                } else {
+                    let errors: Vec<String> = result
+                        .errors
+                        .iter()
+                        .map(|e| match (e.line, e.column) {
+                            (Some(l), Some(c)) => format!("{}:{}: {}", l, c, e.message),
+                            (Some(l), None) => format!("{}: {}", l, e.message),
+                            _ => e.message.clone(),
+                        })
+                        .collect();
+                    FileValidationResult::invalid(
+                        file_path,
+                        target_url,
+                        errors.len() as i32,
+                        duration,
+                        errors,
+                    )
                 }
-                ValidationResult::Invalid {
-                    error_count,
-                    errors,
-                } => FileValidationResult::invalid(
-                    file_path,
-                    target_url,
-                    error_count,
-                    duration,
-                    errors,
-                ),
-                ValidationResult::InternalError { code } => FileValidationResult::error(
-                    file_path,
-                    ValidationError::LibXml2Internal {
-                        details: format!("Internal error code: {}", code),
-                    },
-                    duration,
-                ),
-            },
-            Ok(Err(e)) => FileValidationResult::error(file_path, e.into(), duration),
+            }
+            Ok(Err(e)) => FileValidationResult::error(file_path, e, duration),
             Err(e) => FileValidationResult::error(
                 file_path,
                 ValidationError::Concurrency {
@@ -747,7 +735,6 @@ impl ValidationEngine {
         let result = Self::validate_single_file_internal(
             file_path.to_path_buf(),
             Arc::clone(&self.schema_loader),
-            Arc::clone(&self.libxml2_wrapper),
             self.config.schema_override.clone(),
         )
         .await;
@@ -758,11 +745,6 @@ impl ValidationEngine {
     /// Get the schema loader for direct access
     pub fn schema_loader(&self) -> &Arc<SchemaLoader> {
         &self.schema_loader
-    }
-
-    /// Get the libxml2 wrapper for direct access
-    pub fn libxml2_wrapper(&self) -> &Arc<LibXml2Wrapper> {
-        &self.libxml2_wrapper
     }
 
     /// Get the validation configuration
@@ -1215,35 +1197,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validation_status_from_validation_result() {
-        let valid_result = ValidationResult::Valid;
-        let status: ValidationStatus = valid_result.into();
-        assert!(status.is_valid());
-
-        let invalid_result = ValidationResult::Invalid {
-            error_count: 3,
-            errors: vec![],
-        };
-        let status: ValidationStatus = invalid_result.into();
-        assert!(status.is_invalid());
-        if let ValidationStatus::Invalid { error_count } = status {
-            assert_eq!(error_count, 3);
-        } else {
-            panic!("Expected Invalid status");
-        }
-
-        let error_result = ValidationResult::InternalError { code: -1 };
-        let status: ValidationStatus = error_result.into();
-        assert!(status.is_error());
-    }
-
-    #[tokio::test]
     async fn test_engine_accessors() {
         let (engine, _temp_dir) = create_test_validation_engine();
 
-        // Test that we can access the components
         let _schema_loader = engine.schema_loader();
-        let _libxml2_wrapper = engine.libxml2_wrapper();
         let config = engine.config();
 
         assert_eq!(config.max_concurrent_validations, 2);

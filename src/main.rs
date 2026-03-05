@@ -14,7 +14,6 @@ async fn main() -> Result<(), ValidationError> {
     }
 
     let config = Config::from_cli(&cli);
-    let _libxml2_wrapper = LibXml2Wrapper::new();
 
     if config.verbose && !config.quiet {
         println!("XML Validator");

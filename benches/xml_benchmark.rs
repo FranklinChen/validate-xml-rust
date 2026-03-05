@@ -1,6 +1,7 @@
 use divan::Bencher;
 use std::sync::Arc;
-use validate_xml::LibXml2Wrapper;
+use xmloxide::tree::Document;
+use xmloxide::validation::xsd::{parse_xsd, validate_xsd};
 
 fn main() {
     divan::main();
@@ -28,24 +29,14 @@ const INVALID_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </root>"#;
 
 #[divan::bench]
-fn parse_schema(bencher: Bencher) {
-    let wrapper = LibXml2Wrapper::new();
-    let schema_data = SIMPLE_XSD.as_bytes();
-
-    bencher.bench_local(move || {
-        wrapper
-            .parse_schema_from_memory(schema_data)
-            .expect("Failed to parse schema")
-    });
+fn bench_parse_schema(bencher: Bencher) {
+    bencher.bench_local(|| parse_xsd(SIMPLE_XSD).expect("Failed to parse schema"));
 }
 
 #[divan::bench]
-fn validate_valid_file(bencher: Bencher) {
-    let wrapper = LibXml2Wrapper::new();
-    let schema_data = SIMPLE_XSD.as_bytes();
-    let schema = Arc::new(wrapper.parse_schema_from_memory(schema_data).unwrap());
+fn bench_validate_valid_file(bencher: Bencher) {
+    let schema = Arc::new(parse_xsd(SIMPLE_XSD).unwrap());
 
-    // Write to a temp file because validation API requires a file path
     use std::io::Write;
     use tempfile::NamedTempFile;
     let mut file = NamedTempFile::new().unwrap();
@@ -53,17 +44,14 @@ fn validate_valid_file(bencher: Bencher) {
     let path = file.path().to_path_buf();
 
     bencher.bench_local(move || {
-        wrapper
-            .validate_file(&schema, &path)
-            .expect("Validation failed")
+        let doc = Document::parse_file(&path).expect("Failed to parse XML");
+        validate_xsd(&doc, &schema)
     });
 }
 
 #[divan::bench]
-fn validate_invalid_file(bencher: Bencher) {
-    let wrapper = LibXml2Wrapper::new();
-    let schema_data = SIMPLE_XSD.as_bytes();
-    let schema = Arc::new(wrapper.parse_schema_from_memory(schema_data).unwrap());
+fn bench_validate_invalid_file(bencher: Bencher) {
+    let schema = Arc::new(parse_xsd(SIMPLE_XSD).unwrap());
 
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -72,8 +60,7 @@ fn validate_invalid_file(bencher: Bencher) {
     let path = file.path().to_path_buf();
 
     bencher.bench_local(move || {
-        wrapper
-            .validate_file(&schema, &path)
-            .expect("Validation failed")
+        let doc = Document::parse_file(&path).expect("Failed to parse XML");
+        validate_xsd(&doc, &schema)
     });
 }
