@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # XML validation (pure Rust, no system dependency)
-xmloxide = { version = "0.1", default-features = false }
+xmloxide = { version = "0.3", default-features = false }
 
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
