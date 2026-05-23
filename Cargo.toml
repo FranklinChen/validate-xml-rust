@@ -1,6 +1,6 @@
 [package]
 name = "validate-xml"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Franklin Chen <franklinchen@franklinchen.com>"]
 edition = "2024"
 license = "MIT"
@@ -11,10 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 # XML validation (pure Rust, no system dependency)
-xmloxide = { version = "0.3", default-features = false }
+xmloxide = { version = "0.4", default-features = false }
 
 # Async runtime
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # Caching (moka for memory, cacache for disk persistence)
 moka = { version = "0.12", features = ["future"] }
@@ -29,10 +29,10 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 thiserror = "2.0"
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 
-# Regular expressions
-regex = "1.12"
+# Streaming XML pull-parser (for schema-URL extraction from XML prologs)
+quick-xml = "0.40"
 
 # Progress reporting
 indicatif = "0.18"
@@ -50,7 +50,7 @@ globset = "0.4.18"
 
 [dev-dependencies]
 # Testing dependencies
-tempfile = "3.26"
+tempfile = "3.27"
 divan = "0.1.21"
 
 [[bench]]

@@ -48,11 +48,7 @@ impl ParsedSchemaCache {
     ///
     /// The `loader` future is only executed if the key is missing.
     /// Moka ensures that concurrent requests for the same key wait for the single leader to finish.
-    pub async fn get_or_load<F, Fut, E>(
-        &self,
-        key: String,
-        loader: F,
-    ) -> Result<Arc<XsdSchema>, E>
+    pub async fn get_or_load<F, Fut, E>(&self, key: String, loader: F) -> Result<Arc<XsdSchema>, E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<XsdSchema>, E>>,

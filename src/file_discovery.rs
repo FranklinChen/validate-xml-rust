@@ -207,9 +207,10 @@ impl FileDiscovery {
 
         // Check exclude patterns first
         if let Some(exclude_set) = &self.exclude_set
-            && exclude_set.is_match(path) {
-                return false;
-            }
+            && exclude_set.is_match(path)
+        {
+            return false;
+        }
 
         // Check include patterns (if any are specified, at least one must match)
         if let Some(include_set) = &self.include_set {

@@ -611,11 +611,7 @@ impl ValidationEngine {
 
         // Use schema override if provided, otherwise extract from XML
         let schema_ref = if let Some(schema_path) = schema_override {
-            let url = schema_path.display().to_string();
-            crate::schema_loader::SchemaReference {
-                url,
-                source_type: crate::schema_loader::SchemaSourceType::Local(schema_path),
-            }
+            crate::schema_loader::SchemaReference::Local(schema_path)
         } else {
             match schema_loader
                 .extractor()
@@ -643,33 +639,36 @@ impl ValidationEngine {
             }
         };
 
-        let target_url = schema_ref.url.clone();
+        // `cache_key` (namespaced) keys the L1 cache and prevents
+        // local/remote collisions; `schema_display` is the bare path/URL
+        // surfaced to users via `FileValidationResult::schema_url`.
+        let cache_key = schema_ref.cache_key();
+        let schema_display = schema_ref.to_string();
         let loader_clone = schema_loader.clone();
 
         let schema = match schema_loader
             .cache()
             .parsed()
-            .get_or_load(target_url.clone(), || async move {
+            .get_or_load(cache_key, || async move {
                 let cached_bytes = loader_clone.load_schema(&schema_ref).await?;
 
                 // Parse schema on a blocking thread (CPU-intensive for large schemas)
                 let data = cached_bytes.data.clone();
-                let parsed: XsdSchema =
-                    tokio::task::spawn_blocking(move || {
-                        let schema_str =
-                            std::str::from_utf8(&data).map_err(|e| ValidationError::SchemaParsing {
-                                url: String::new(),
-                                details: format!("Schema is not valid UTF-8: {}", e),
-                            })?;
-                        parse_xsd(schema_str).map_err(|e| ValidationError::SchemaParsing {
+                let parsed: XsdSchema = tokio::task::spawn_blocking(move || {
+                    let schema_str =
+                        std::str::from_utf8(&data).map_err(|e| ValidationError::SchemaParsing {
                             url: String::new(),
-                            details: e.message,
-                        })
+                            details: format!("Schema is not valid UTF-8: {}", e),
+                        })?;
+                    parse_xsd(schema_str).map_err(|e| ValidationError::SchemaParsing {
+                        url: String::new(),
+                        details: e.message,
                     })
-                    .await
-                    .map_err(|e| ValidationError::Concurrency {
-                        details: e.to_string(),
-                    })??;
+                })
+                .await
+                .map_err(|e| ValidationError::Concurrency {
+                    details: e.to_string(),
+                })??;
 
                 Ok(Arc::new(parsed))
             })
@@ -699,7 +698,7 @@ impl ValidationEngine {
         match validation_result {
             Ok(Ok(result)) => {
                 if result.is_valid {
-                    FileValidationResult::valid(file_path, target_url, duration)
+                    FileValidationResult::valid(file_path, schema_display, duration)
                 } else {
                     let errors: Vec<String> = result
                         .errors
@@ -712,7 +711,7 @@ impl ValidationEngine {
                         .collect();
                     FileValidationResult::invalid(
                         file_path,
-                        target_url,
+                        schema_display,
                         errors.len() as i32,
                         duration,
                         errors,
@@ -1265,5 +1264,89 @@ mod tests {
             result
         );
         assert_eq!(result.schema_url, Some(schema_file.display().to_string()));
+    }
+
+    /// End-to-end regression test for the L1 parsed-schema cache-key
+    /// collision that `SchemaReference::cache_key()` fixes.
+    ///
+    /// Before the fix, two XML files in different directories that each
+    /// referenced `"schema.xsd"` (relative) shared an L1 cache entry
+    /// keyed on the raw reference string. The second file would be
+    /// validated against the *first* file's schema. Each directory here
+    /// uses a differently-named root element (`alpha` vs `beta`) so that
+    /// a mis-cached schema surfaces as an `Invalid` validation result —
+    /// that's the signal the test watches for.
+    #[tokio::test]
+    async fn test_l1_cache_key_does_not_collide_across_directories()
+    -> std::result::Result<(), ValidationError> {
+        let tmp = TempDir::new()?;
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir_all(&dir_a)?;
+        std::fs::create_dir_all(&dir_b)?;
+
+        let schema_a = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="alpha" type="xs:string"/>
+</xs:schema>"#;
+        let doc_a = r#"<?xml version="1.0" encoding="UTF-8"?>
+<alpha xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="schema.xsd">hello</alpha>"#;
+
+        // Both docs reference `schema.xsd` (relative) — identical raw
+        // strings, different resolved paths. That's the collision input.
+        let schema_b = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="beta" type="xs:string"/>
+</xs:schema>"#;
+        let doc_b = r#"<?xml version="1.0" encoding="UTF-8"?>
+<beta xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="schema.xsd">world</beta>"#;
+
+        std::fs::write(dir_a.join("schema.xsd"), schema_a)?;
+        std::fs::write(dir_b.join("schema.xsd"), schema_b)?;
+        let xml_a = dir_a.join("doc.xml");
+        let xml_b = dir_b.join("doc.xml");
+        std::fs::write(&xml_a, doc_a)?;
+        std::fs::write(&xml_b, doc_b)?;
+
+        // One engine, one cache, two validate calls — a collision would
+        // manifest as doc B reusing doc A's parsed schema.
+        let cache = Arc::new(SchemaCache::new(CacheConfig {
+            directory: tmp.path().join("cache"),
+            ttl_hours: 1,
+            max_size_mb: 100,
+            max_memory_entries: 100,
+            memory_ttl_seconds: 300,
+        }));
+        let http_client = AsyncHttpClient::new(HttpClientConfig::default())?;
+        let engine = ValidationEngine::new(
+            cache,
+            http_client,
+            ValidationConfig {
+                max_concurrent_validations: 2,
+                validation_timeout: Duration::from_secs(5),
+                fail_fast: false,
+                show_progress: false,
+                collect_metrics: true,
+                schema_override: None,
+            },
+        )?;
+
+        let result_a = engine.validate_single_file(&xml_a).await?;
+        let result_b = engine.validate_single_file(&xml_b).await?;
+
+        assert!(
+            result_a.status.is_valid(),
+            "doc A should validate against its own schema; got {:?}",
+            result_a
+        );
+        assert!(
+            result_b.status.is_valid(),
+            "doc B should validate against its own schema; the old cache-key bug \
+             would have reused A's parsed schema here, failing with an Invalid; got {:?}",
+            result_b
+        );
+        Ok(())
     }
 }

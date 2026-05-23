@@ -177,9 +177,10 @@ impl Cli {
             return Err("Number of threads must be greater than 0".to_string());
         }
         if let Some(ref schema) = self.schema
-            && !schema.exists() {
-                return Err(format!("Schema file does not exist: {}", schema.display()));
-            }
+            && !schema.exists()
+        {
+            return Err(format!("Schema file does not exist: {}", schema.display()));
+        }
         Ok(())
     }
 

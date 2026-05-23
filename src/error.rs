@@ -25,6 +25,13 @@ pub enum ValidationError {
     #[error("Schema parsing error: {url} - {details}")]
     SchemaParsing { url: String, details: String },
 
+    /// Structural error encountered while parsing an XML *input* file (as
+    /// opposed to an XSD schema). Distinct from `SchemaParsing` so the error
+    /// message carries the offending file path rather than repurposing a
+    /// URL-shaped field.
+    #[error("XML parse error: {file} - {details}")]
+    XmlParsing { file: PathBuf, details: String },
+
     #[error("XML validation failed: {file} - {details}")]
     ValidationFailed { file: PathBuf, details: String },
 

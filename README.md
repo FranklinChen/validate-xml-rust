@@ -184,15 +184,15 @@ The validator consists of four main components:
 
 ### Benchmarks (divan)
 
-Micro-benchmarks measuring the core validation engine (on Apple M1 Max):
+Micro-benchmarks measuring the core validation engine (xmloxide 0.3.1, on Apple M3 Ultra):
 
 | Operation | Median Time | Throughput |
 |-----------|-------------|------------|
-| Schema Parsing | ~6.0 µs | 166,000/sec |
-| Valid XML Validation | ~17.2 µs | 58,000/sec |
-| Invalid XML Validation | ~17.6 µs | 56,000/sec |
+| Schema Parsing | ~5.25 µs | 190,000/sec |
+| Valid XML Validation | ~11.0 µs | 91,000/sec |
+| Invalid XML Validation | ~10.0 µs | 100,000/sec |
 
-*Note: Validation includes reading the XML file and checking against the cached schema.*
+*Note: Validation includes reading the XML file and checking against the cached schema. These numbers measure xmloxide directly; schema-URL extraction (a few µs, amortized once per file) runs before the validation hot path and is not included.*
 
 ---
 

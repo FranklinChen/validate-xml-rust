@@ -21,9 +21,7 @@ pub use error::ValidationError;
 pub use file_discovery::{DiscoveryStats, FileDiscovery};
 pub use http_client::{AsyncHttpClient, HttpClientConfig};
 pub use output::Output;
-pub use schema_loader::{
-    SchemaExtractor, SchemaLoader, SchemaReference, SchemaSourceType, extract_schema_url_async,
-};
+pub use schema_loader::{SchemaExtractor, SchemaLoader, SchemaReference};
 pub use validator::{
     FileValidationResult, PerformanceMetrics, ProgressCallback, ValidationConfig, ValidationEngine,
     ValidationPhase, ValidationProgress, ValidationResults, ValidationStatus,
