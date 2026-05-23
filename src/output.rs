@@ -2,7 +2,7 @@
 //!
 //! This module provides output formatting for validation results.
 
-use atty;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use crate::cli::VerbosityLevel;
@@ -20,7 +20,7 @@ impl Output {
     pub fn new(verbosity: VerbosityLevel) -> Self {
         Self {
             verbosity,
-            show_colors: atty::is(atty::Stream::Stdout),
+            show_colors: std::io::stdout().is_terminal(),
         }
     }
 

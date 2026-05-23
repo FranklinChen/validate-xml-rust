@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// Verbosity levels for output
@@ -50,7 +51,7 @@ impl Config {
             retry_attempts: cli.retry_attempts,
             include_patterns: cli.include_patterns.clone(),
             exclude_patterns: cli.exclude_patterns.clone(),
-            progress: cli.progress || (atty::is(atty::Stream::Stderr) && !cli.quiet),
+            progress: cli.progress || (std::io::stderr().is_terminal() && !cli.quiet),
             fail_fast: cli.fail_fast,
             max_cache_size_mb: cli.max_cache_size,
             schema: cli.schema.clone(),
