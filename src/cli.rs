@@ -75,8 +75,7 @@ impl Config {
 #[command(about = "Validate XML files against their schemas with high performance and caching")]
 #[command(
     long_about = "Validate XML files against their schemas with high performance and caching.\n\n\
-Note: When an XML file references multiple schemas via xsi:schemaLocation, only the \
-first schema URL is used for validation. Multiple schema validation is not currently supported."
+Namespace/location pairs in xsi:schemaLocation are matched to the document element."
 )]
 #[command(version)]
 pub struct Cli {
@@ -122,8 +121,12 @@ pub struct Cli {
     #[arg(long = "cache-ttl", default_value = "24")]
     pub cache_ttl: u64,
 
-    /// HTTP request timeout in seconds
-    #[arg(long = "timeout", default_value = "30")]
+    /// Per-file validation and HTTP request timeout in seconds
+    #[arg(
+        long = "timeout",
+        default_value = "30",
+        help = "Per-file validation and HTTP request timeout in seconds"
+    )]
     pub timeout: u64,
 
     /// Number of retry attempts for failed downloads
@@ -142,11 +145,14 @@ pub struct Cli {
     #[arg(long = "progress")]
     pub progress: bool,
 
-    /// Fail fast on first validation error
-    #[arg(long = "fail-fast")]
+    /// Stop scheduling after the first invalid or error result
+    #[arg(
+        long = "fail-fast",
+        help = "Stop scheduling after the first invalid or error result"
+    )]
     pub fail_fast: bool,
 
-    /// Maximum cache size in MB
+    /// Maximum indexed schema-data budget in MB
     #[arg(long = "max-cache-size", default_value = "100")]
     pub max_cache_size: u64,
 
@@ -177,10 +183,19 @@ impl Cli {
         {
             return Err("Number of threads must be greater than 0".to_string());
         }
+        if self.timeout == 0 {
+            return Err("Timeout must be greater than 0".to_string());
+        }
+        if self.cache_ttl == 0 {
+            return Err("Cache TTL must be greater than 0".to_string());
+        }
+        if self.max_cache_size == 0 {
+            return Err("Maximum cache size must be greater than 0".to_string());
+        }
         if let Some(ref schema) = self.schema
-            && !schema.exists()
+            && !schema.is_file()
         {
-            return Err(format!("Schema file does not exist: {}", schema.display()));
+            return Err(format!("Schema path is not a file: {}", schema.display()));
         }
         Ok(())
     }

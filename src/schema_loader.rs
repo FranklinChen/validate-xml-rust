@@ -24,15 +24,15 @@ use crate::http_client::AsyncHttpClient;
 /// author chose to bind to it. Matching by URI rather than by literal
 /// `xsi:` prefix makes the extractor correct for documents that bind xsi
 /// to a non-standard prefix.
-const XSI_NAMESPACE_URI: &[u8] = b"http://www.w3.org/2001/XMLSchema-instance";
+const XSI_NAMESPACE_URI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Namespace URI of XML Schema Definition elements themselves, used when
 /// probing fetched schema bytes to confirm they are an XSD.
-const XSD_NAMESPACE_URI: &[u8] = b"http://www.w3.org/2001/XMLSchema";
+const XSD_NAMESPACE_URI: &str = "http://www.w3.org/2001/XMLSchema";
 
 /// Target of the W3C xml-model processing instruction. See
 /// <https://www.w3.org/TR/xml-model/>.
-const XML_MODEL_PI_TARGET: &[u8] = b"xml-model";
+const XML_MODEL_PI_TARGET: &str = "xml-model";
 
 /// A schema source extracted from an XML input — either a resolved local
 /// filesystem path or a remote URL.
@@ -50,17 +50,62 @@ pub enum SchemaReference {
     /// Filesystem path, already resolved against the XML file's parent
     /// directory if the original reference was relative.
     Local(PathBuf),
-    /// `http://` or `https://` URL, held as a string rather than
-    /// `url::Url` to avoid a dependency whose sole benefit would be
-    /// parsing the scheme — `reqwest` re-parses the URL anyway when it
-    /// fetches.
+    /// Normalized `http://` or `https://` URL. It remains a string at this
+    /// boundary because the HTTP client accepts strings and the enum already
+    /// records that parsing and scheme validation succeeded.
     Remote(String),
 }
 
+/// Why a document points at a schema. Keeping this alongside the location
+/// prevents an unrelated namespace pair from being selected merely because it
+/// appeared first in `xsi:schemaLocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaHintKind {
+    Namespace(String),
+    NoNamespace,
+    XmlModel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaHint {
+    pub kind: SchemaHintKind,
+    pub reference: SchemaReference,
+}
+
+/// Schema hints plus the namespace of the document element they describe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedSchemaHints {
+    pub root_namespace: Option<String>,
+    pub hints: Vec<SchemaHint>,
+}
+
+impl ExtractedSchemaHints {
+    /// Select the hint applicable to the document element. An xml-model PI is
+    /// a fallback; namespace-aware xsi hints take precedence.
+    pub fn applicable(&self) -> Option<&SchemaReference> {
+        let matching_kind = match &self.root_namespace {
+            Some(namespace) => self.hints.iter().find(|hint| {
+                matches!(&hint.kind, SchemaHintKind::Namespace(candidate) if candidate == namespace)
+            }),
+            None => self
+                .hints
+                .iter()
+                .find(|hint| matches!(hint.kind, SchemaHintKind::NoNamespace)),
+        };
+        matching_kind
+            .or_else(|| {
+                self.hints
+                    .iter()
+                    .find(|hint| matches!(hint.kind, SchemaHintKind::XmlModel))
+            })
+            .map(|hint| &hint.reference)
+    }
+}
+
 impl SchemaReference {
-    /// Stable key for both cache tiers. The `local:` prefix partitions the
-    /// local and remote key spaces so a path that happens to start with
-    /// "http" can never collide with a remote URL.
+    /// Stable location identity. The `local:` prefix partitions local and
+    /// remote sources. Local cache freshness additionally requires
+    /// [`SchemaLoader::cache_key`], which includes the schema graph digest.
     pub fn cache_key(&self) -> String {
         match self {
             Self::Local(path) => format!("local:{}", path.display()),
@@ -90,9 +135,8 @@ impl std::fmt::Display for SchemaReference {
 /// Sources considered, in document order:
 ///
 /// * `xsi:schemaLocation="ns1 loc1 ns2 loc2 ..."` on the root element —
-///   each (namespace, location) pair emits one `SchemaReference` from the
-///   *location* half. Namespace halves are discarded: the schema documents
-///   themselves declare their target namespaces.
+///   each pair is retained as a namespace-aware `SchemaHint` so the location
+///   matching the document element can be selected.
 /// * `xsi:noNamespaceSchemaLocation="loc"` on the root element.
 /// * `<?xml-model href="loc" … ?>` processing instructions in the prolog.
 ///
@@ -115,10 +159,21 @@ impl SchemaExtractor {
     /// parse happen on a tokio blocking thread so the async runtime stays
     /// free for I/O elsewhere.
     pub async fn extract_schema_urls(&self, file_path: &Path) -> Result<Vec<SchemaReference>> {
+        Ok(self
+            .extract_schema_hints(file_path)
+            .await?
+            .hints
+            .into_iter()
+            .map(|hint| hint.reference)
+            .collect())
+    }
+
+    /// Extract namespace-preserving schema hints from an XML file.
+    pub async fn extract_schema_hints(&self, file_path: &Path) -> Result<ExtractedSchemaHints> {
         let path = file_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path).map_err(ValidationError::from)?;
-            parse_schema_references(std::io::BufReader::new(file), &path)
+            parse_schema_hints(std::io::BufReader::new(file), &path)
         })
         .await
         .map_err(|e| ValidationError::Concurrency {
@@ -132,16 +187,16 @@ impl SchemaExtractor {
     /// [`SchemaReference::Local`] path is absolute-or-relative-to-cwd, not
     /// relative-to-some-other-XML-file's-directory.
     ///
-    /// Scheme detection uses `starts_with` rather than a full URL parser —
-    /// `http://` and `https://` are the only remote schemes this tool
-    /// supports, and adding the `url` crate just for this check would be
-    /// disproportionate (~500KB compile impact for one branch). If ftp/file
-    /// support ever matters, swap in `url::Url::parse`.
+    /// URL parsing is delegated to `url`, which is already part of reqwest's
+    /// dependency graph. Only HTTP(S) references are remote; everything else
+    /// remains a filesystem path.
     fn resolve_reference(raw: &str, xml_file_path: &Path) -> SchemaReference {
-        if raw.starts_with("http://") || raw.starts_with("https://") {
-            SchemaReference::Remote(raw.to_string())
-        } else if raw.starts_with('/') {
-            SchemaReference::Local(PathBuf::from(raw))
+        if let Ok(url) = url::Url::parse(raw)
+            && matches!(url.scheme(), "http" | "https")
+        {
+            SchemaReference::Remote(url.into())
+        } else if raw.starts_with('/') || Path::new(raw).is_absolute() {
+            SchemaReference::Local(raw.into())
         } else {
             SchemaReference::Local(xml_file_path.parent().unwrap_or(Path::new(".")).join(raw))
         }
@@ -151,17 +206,18 @@ impl SchemaExtractor {
 /// Pull-parse the given XML input, collecting every schema reference from
 /// the prolog and the root element. Stops after the root element's Start
 /// (or Empty) event — we never read past the first element's attributes.
-fn parse_schema_references<R: std::io::BufRead>(
+fn parse_schema_hints<R: std::io::BufRead>(
     input: R,
     xml_file_path: &Path,
-) -> Result<Vec<SchemaReference>> {
+) -> Result<ExtractedSchemaHints> {
     let mut reader = NsReader::from_reader(input);
     // Strip leading/trailing whitespace from text events so indentation
     // doesn't produce noise. Does not affect attribute values.
     reader.config_mut().trim_text(true);
 
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let mut refs: Vec<SchemaReference> = Vec::new();
+    let mut hints = Vec::new();
+    let mut root_namespace = None;
 
     loop {
         buf.clear();
@@ -175,11 +231,22 @@ fn parse_schema_references<R: std::io::BufRead>(
             Ok((_, Event::Eof)) => break,
             Ok((_, Event::PI(pi))) => {
                 if pi.target() == XML_MODEL_PI_TARGET {
-                    extract_xml_model_href(&pi, xml_file_path, &mut refs)?;
+                    extract_xml_model_href(&pi, xml_file_path, &mut hints)?;
                 }
             }
-            Ok((_, Event::Start(ref start))) | Ok((_, Event::Empty(ref start))) => {
-                extract_xsi_schema_attrs(&reader, start, xml_file_path, &mut refs)?;
+            Ok((namespace, Event::Start(ref start))) | Ok((namespace, Event::Empty(ref start))) => {
+                root_namespace = match namespace {
+                    ResolveResult::Bound(Namespace(uri)) => Some(
+                        std::str::from_utf8(uri.as_ref())
+                            .map_err(|error| ValidationError::XmlParsing {
+                                file: xml_file_path.to_path_buf(),
+                                details: format!("root namespace is not UTF-8: {error}"),
+                            })?
+                            .to_owned(),
+                    ),
+                    ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+                };
+                extract_xsi_schema_attrs(&reader, start, xml_file_path, &mut hints)?;
                 // Root element reached; nothing past it can contribute
                 // schema references.
                 break;
@@ -191,12 +258,15 @@ fn parse_schema_references<R: std::io::BufRead>(
         }
     }
 
-    if refs.is_empty() {
+    if hints.is_empty() {
         return Err(ValidationError::SchemaUrlNotFound {
             file: xml_file_path.to_path_buf(),
         });
     }
-    Ok(refs)
+    Ok(ExtractedSchemaHints {
+        root_namespace,
+        hints,
+    })
 }
 
 /// Walk the attributes of the root start tag, emitting a `SchemaReference`
@@ -206,7 +276,7 @@ fn extract_xsi_schema_attrs<R: std::io::BufRead>(
     reader: &NsReader<R>,
     start: &BytesStart<'_>,
     xml_file_path: &Path,
-    refs: &mut Vec<SchemaReference>,
+    hints: &mut Vec<SchemaHint>,
 ) -> Result<()> {
     for attr_result in start.attributes().with_checks(false) {
         let attr = attr_result.map_err(|err| ValidationError::XmlParsing {
@@ -229,7 +299,7 @@ fn extract_xsi_schema_attrs<R: std::io::BufRead>(
             })?;
 
         match local.as_ref() {
-            b"schemaLocation" => {
+            "schemaLocation" => {
                 // Per the XML Schema spec, schemaLocation is a
                 // whitespace-separated list of `(namespace, location)`
                 // pairs. Stream pairwise and surface an odd trailing token
@@ -246,11 +316,17 @@ fn extract_xsi_schema_attrs<R: std::io::BufRead>(
                             ),
                         });
                     };
-                    refs.push(SchemaExtractor::resolve_reference(location, xml_file_path));
+                    hints.push(SchemaHint {
+                        kind: SchemaHintKind::Namespace(ns_token.to_owned()),
+                        reference: SchemaExtractor::resolve_reference(location, xml_file_path),
+                    });
                 }
             }
-            b"noNamespaceSchemaLocation" => {
-                refs.push(SchemaExtractor::resolve_reference(&value, xml_file_path));
+            "noNamespaceSchemaLocation" => {
+                hints.push(SchemaHint {
+                    kind: SchemaHintKind::NoNamespace,
+                    reference: SchemaExtractor::resolve_reference(&value, xml_file_path),
+                });
             }
             _ => {}
         }
@@ -268,14 +344,14 @@ fn extract_xsi_schema_attrs<R: std::io::BufRead>(
 fn extract_xml_model_href(
     pi: &BytesPI<'_>,
     xml_file_path: &Path,
-    refs: &mut Vec<SchemaReference>,
+    hints: &mut Vec<SchemaHint>,
 ) -> Result<()> {
     for attr_result in pi.attributes() {
         let attr = attr_result.map_err(|err| ValidationError::XmlParsing {
             file: xml_file_path.to_path_buf(),
             details: format!("malformed xml-model pseudo-attribute: {err}"),
         })?;
-        if attr.key.as_ref() != b"href" {
+        if attr.key.as_ref() != "href" {
             continue;
         }
         let value = attr
@@ -284,7 +360,10 @@ fn extract_xml_model_href(
                 file: xml_file_path.to_path_buf(),
                 details: format!("xml-model href unescape: {err}"),
             })?;
-        refs.push(SchemaExtractor::resolve_reference(&value, xml_file_path));
+        hints.push(SchemaHint {
+            kind: SchemaHintKind::XmlModel,
+            reference: SchemaExtractor::resolve_reference(&value, xml_file_path),
+        });
         return Ok(());
     }
     Ok(())
@@ -310,25 +389,18 @@ impl SchemaLoader {
 
     /// Load the schema for an XML file.
     ///
-    /// The extractor may return multiple `SchemaReference`s (one per entry
-    /// in `xsi:schemaLocation`, plus any `<?xml-model?>` PIs), but this
-    /// method currently loads only the first. True multi-schema
-    /// composition would require upstream changes to `xmloxide`: as of
-    /// 0.3.x, `XsdSchema` has no merge API and `validate_xsd` takes a
-    /// single schema (no `xs:import`/`xs:include` support either). Until
-    /// that lands, any extra references are dropped.
+    /// Namespace-aware xsi hints are matched to the document element;
+    /// `xml-model` is used only as a fallback.
     pub async fn load_schema_for_file(&self, xml_file_path: &Path) -> Result<Arc<CachedSchema>> {
-        let schema_refs = self.extractor.extract_schema_urls(xml_file_path).await?;
-
+        let extracted = self.extractor.extract_schema_hints(xml_file_path).await?;
         let schema_ref =
-            schema_refs
-                .into_iter()
-                .next()
+            extracted
+                .applicable()
                 .ok_or_else(|| ValidationError::SchemaUrlNotFound {
                     file: xml_file_path.to_path_buf(),
                 })?;
 
-        self.load_schema(&schema_ref).await
+        self.load_schema(schema_ref).await
     }
 
     /// Load a schema by reference (local or remote)
@@ -339,10 +411,22 @@ impl SchemaLoader {
         }
     }
 
+    /// Return a cache key that changes when a local schema file changes.
+    ///
+    /// Remote schemas use their URL identity. Local schemas include the
+    /// canonical path plus a SHA-256 digest of the root schema and its complete
+    /// local composition graph, so edits to either the root or a dependency
+    /// invalidate both raw and parsed entries.
+    pub async fn cache_key(&self, schema_ref: &SchemaReference) -> Result<String> {
+        match schema_ref {
+            SchemaReference::Remote(_) => Ok(schema_ref.cache_key()),
+            SchemaReference::Local(path) => local_schema_cache_key(path).await,
+        }
+    }
+
     /// Load a local schema file
     pub async fn load_local_schema(&self, schema_path: &Path) -> Result<Arc<CachedSchema>> {
-        // For local files, we use the file path as the cache key
-        let cache_key = format!("local:{}", schema_path.display());
+        let cache_key = local_schema_cache_key(schema_path).await?;
 
         // Check cache first
         if let Some(cached_schema) = self.cache.get(&cache_key).await? {
@@ -363,12 +447,7 @@ impl SchemaLoader {
         self.validate_schema_content(&schema_data, &schema_path.display().to_string())?;
 
         // Cache the schema (local schemas don't have ETags or Last-Modified headers)
-        self.cache.set(&cache_key, schema_data, None, None).await?;
-
-        // Return the cached schema
-        self.cache.get(&cache_key).await?.ok_or_else(|| {
-            ValidationError::Cache("Failed to retrieve just-cached local schema".to_string())
-        })
+        self.cache.set(&cache_key, schema_data, None, None).await
     }
 
     /// Load a remote schema with caching
@@ -383,14 +462,10 @@ impl SchemaLoader {
 
         // Validate the schema content
         self.validate_schema_content(&schema_data, url)?;
+        crate::backend::enforce_resource_policy(&schema_data, url, None)?;
 
         // Cache the schema (TODO: extract ETags and Last-Modified from HTTP response)
-        self.cache.set(url, schema_data, None, None).await?;
-
-        // Return the cached schema
-        self.cache.get(url).await?.ok_or_else(|| {
-            ValidationError::Cache("Failed to retrieve just-cached remote schema".to_string())
-        })
+        self.cache.set(url, schema_data, None, None).await
     }
 
     /// Probe the fetched bytes to confirm they are an XML Schema Definition
@@ -398,9 +473,8 @@ impl SchemaLoader {
     ///
     /// This is a lightweight pre-flight at the loader boundary — enough to
     /// catch "this URL returned HTML/404/plain text" before we poison the
-    /// disk cache with non-XSD bytes. Full XSD validation is deferred to
-    /// xmloxide's `parse_xsd` at use time, which produces far better error
-    /// messages for structural XSD problems.
+    /// disk cache with non-XSD bytes. Full XSD compilation is deferred to
+    /// libxml2 at use time.
     ///
     /// The match is by namespace URI rather than by prefix, so
     /// `<xs:schema>`, `<xsd:schema>`, and any other prefix binding all
@@ -434,7 +508,7 @@ impl SchemaLoader {
                         ResolveResult::Bound(Namespace(uri)) if uri == XSD_NAMESPACE_URI
                     );
                     let local = start.local_name();
-                    if in_xsd_ns && local.as_ref() == b"schema" {
+                    if in_xsd_ns && local.as_ref() == "schema" {
                         return Ok(());
                     }
                     return Err(ValidationError::SchemaParsing {
@@ -464,6 +538,48 @@ impl SchemaLoader {
     pub fn http_client(&self) -> &AsyncHttpClient {
         &self.http_client
     }
+}
+
+async fn local_schema_cache_key(schema_path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = tokio::fs::canonicalize(schema_path)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => ValidationError::SchemaNotFound {
+                url: schema_path.display().to_string(),
+            },
+            _ => ValidationError::from(error),
+        })?;
+    let data = tokio::fs::read(&canonical).await?;
+    let mut hasher = Sha256::new();
+    hash_schema_resource(&mut hasher, &canonical, &data);
+    let scan_path = canonical.clone();
+    let scan_data = data.clone();
+    let mut dependencies = tokio::task::spawn_blocking(move || {
+        crate::backend::local_dependency_paths(&scan_data, &scan_path)
+    })
+    .await
+    .map_err(|error| ValidationError::Concurrency {
+        details: format!("local schema dependency scan failed to join: {error}"),
+    })??;
+    dependencies.sort_unstable();
+    for dependency in dependencies {
+        let dependency_data = tokio::fs::read(&dependency).await?;
+        hash_schema_resource(&mut hasher, &dependency, &dependency_data);
+    }
+    let digest = hasher.finalize();
+    Ok(format!("local:{}:{digest:x}", canonical.display()))
+}
+
+fn hash_schema_resource(hasher: &mut sha2::Sha256, path: &Path, data: &[u8]) {
+    use sha2::Digest;
+
+    let path = path.as_os_str().as_encoded_bytes();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path);
+    hasher.update((data.len() as u64).to_le_bytes());
+    hasher.update(data);
 }
 
 #[cfg(test)]
@@ -516,6 +632,67 @@ mod tests {
     #[tokio::test]
     async fn test_schema_extractor_creation() -> Result<()> {
         let _extractor = SchemaExtractor::new()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applicable_hint_matches_root_namespace_not_first_pair() -> Result<()> {
+        let file = write_xml_file(
+            r#"<wanted:root xmlns:wanted="urn:wanted"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xsi:schemaLocation="urn:other https://example.test/other.xsd urn:wanted https://example.test/wanted.xsd"/>"#,
+        )?;
+        let hints = SchemaExtractor::new()?
+            .extract_schema_hints(file.path())
+            .await?;
+        assert_eq!(hints.root_namespace.as_deref(), Some("urn:wanted"));
+        assert_eq!(
+            hints.applicable().map(ToString::to_string).as_deref(),
+            Some("https://example.test/wanted.xsd")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_cache_key_changes_after_edit() -> Result<()> {
+        let (cache, _cache_dir) = create_test_cache()?;
+        let loader = SchemaLoader::new(cache, create_test_http_client()?)?;
+        let file = write_xml_file("12345678")?;
+        let reference = SchemaReference::Local(file.path().to_path_buf());
+        let before = loader.cache_key(&reference).await?;
+        // Same length, with no sleep: timestamp/size-only keys can miss this.
+        tokio::fs::write(file.path(), "abcdefgh").await?;
+        let after = loader.cache_key(&reference).await?;
+        assert_ne!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_cache_key_changes_after_dependency_edit() -> Result<()> {
+        let (cache, _cache_dir) = create_test_cache()?;
+        let loader = SchemaLoader::new(cache, create_test_http_client()?)?;
+        let directory = TempDir::new()?;
+        let dependency = directory.path().join("types.xsd");
+        tokio::fs::write(
+            &dependency,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><xs:documentation>aaaa</xs:documentation></xs:annotation></xs:schema>"#,
+        )
+        .await?;
+        let main = directory.path().join("main.xsd");
+        tokio::fs::write(
+            &main,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:include schemaLocation="types.xsd"/></xs:schema>"#,
+        )
+        .await?;
+        let reference = SchemaReference::Local(main);
+        let before = loader.cache_key(&reference).await?;
+        tokio::fs::write(
+            &dependency,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><xs:documentation>bbbb</xs:documentation></xs:annotation></xs:schema>"#,
+        )
+        .await?;
+        let after = loader.cache_key(&reference).await?;
+        assert_ne!(before, after);
         Ok(())
     }
 
@@ -761,6 +938,10 @@ mod tests {
             SchemaReference::Remote("https://example.com/schema.xsd".to_string())
         );
         assert_eq!(
+            SchemaExtractor::resolve_reference("HTTPS://EXAMPLE.COM/schema.xsd", xml_path),
+            SchemaReference::Remote("https://example.com/schema.xsd".to_string())
+        );
+        assert_eq!(
             SchemaExtractor::resolve_reference("/absolute/schema.xsd", xml_path),
             SchemaReference::Local(PathBuf::from("/absolute/schema.xsd"))
         );
@@ -939,7 +1120,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Coverage fill-ins for claims made in module docs & CLAUDE.md.
+    // Coverage fill-ins for claims made in module docs and AGENTS.md.
     // ----------------------------------------------------------------------
 
     /// Namespace-URI-based attribute resolution, not literal `xsi:` prefix
@@ -1011,7 +1192,7 @@ mod tests {
     /// `Display` for `SchemaReference` must emit a bare path/URL — the
     /// `local:` namespacing that `cache_key()` adds is an internal
     /// concern and must not leak into user-facing output (it reaches
-    /// users via `FileValidationResult::schema_url`).
+    /// users via the validation outcome's schema field).
     #[test]
     fn test_schema_reference_display() {
         let local = SchemaReference::Local(PathBuf::from("/etc/schema.xsd"));

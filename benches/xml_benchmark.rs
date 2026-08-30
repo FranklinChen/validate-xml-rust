@@ -1,7 +1,5 @@
 use divan::Bencher;
-use std::sync::Arc;
-use xmloxide::tree::Document;
-use xmloxide::validation::xsd::{parse_xsd, validate_xsd};
+use validate_xml::backend::{compile, validate};
 
 fn main() {
     divan::main();
@@ -30,12 +28,14 @@ const INVALID_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 #[divan::bench]
 fn bench_parse_schema(bencher: Bencher) {
-    bencher.bench_local(|| parse_xsd(SIMPLE_XSD).expect("Failed to parse schema"));
+    bencher.bench_local(|| {
+        compile(SIMPLE_XSD.as_bytes(), "benchmark.xsd", None).expect("Failed to compile schema")
+    });
 }
 
 #[divan::bench]
 fn bench_validate_valid_file(bencher: Bencher) {
-    let schema = Arc::new(parse_xsd(SIMPLE_XSD).unwrap());
+    let schema = compile(SIMPLE_XSD.as_bytes(), "benchmark.xsd", None).unwrap();
 
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -43,15 +43,12 @@ fn bench_validate_valid_file(bencher: Bencher) {
     write!(file, "{}", VALID_XML).unwrap();
     let path = file.path().to_path_buf();
 
-    bencher.bench_local(move || {
-        let doc = Document::parse_file(&path).expect("Failed to parse XML");
-        validate_xsd(&doc, &schema)
-    });
+    bencher.bench_local(move || validate(&schema, &path).expect("Failed to validate XML"));
 }
 
 #[divan::bench]
 fn bench_validate_invalid_file(bencher: Bencher) {
-    let schema = Arc::new(parse_xsd(SIMPLE_XSD).unwrap());
+    let schema = compile(SIMPLE_XSD.as_bytes(), "benchmark.xsd", None).unwrap();
 
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -59,8 +56,5 @@ fn bench_validate_invalid_file(bencher: Bencher) {
     write!(file, "{}", INVALID_XML).unwrap();
     let path = file.path().to_path_buf();
 
-    bencher.bench_local(move || {
-        let doc = Document::parse_file(&path).expect("Failed to parse XML");
-        validate_xsd(&doc, &schema)
-    });
+    bencher.bench_local(move || validate(&schema, &path).expect("Failed to validate XML"));
 }

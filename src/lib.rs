@@ -3,6 +3,7 @@
 //! A high-performance, async-first Rust library for validating XML files against XSD schemas
 //! with built-in remote schema caching and concurrent processing.
 
+pub mod backend;
 pub mod cache;
 pub mod cli;
 pub mod error;
@@ -12,18 +13,22 @@ pub mod output;
 pub mod schema_loader;
 pub mod validator;
 
+pub use backend::{CompiledSchema, SchemaValidation};
 pub use cache::{
-    CacheConfig, CacheMetadata, CacheStats, CachedSchema, CleanupStats, ComprehensiveCacheStats,
-    DiskCache, MemoryCache, MemoryCacheStats, ParsedSchemaCache, SchemaCache,
+    CacheAccessStats, CacheConfig, CacheMetadata, CacheStats, CachedSchema, CleanupStats,
+    ComprehensiveCacheStats, DiskCache, MemoryCache, MemoryCacheStats, ParsedSchemaCache,
+    SchemaCache,
 };
 pub use cli::{Cli, Config, VerbosityLevel};
 pub use error::ValidationError;
 pub use file_discovery::{DiscoveryStats, FileDiscovery};
 pub use http_client::{AsyncHttpClient, HttpClientConfig};
 pub use output::Output;
-pub use schema_loader::{SchemaExtractor, SchemaLoader, SchemaReference};
+pub use schema_loader::{
+    ExtractedSchemaHints, SchemaExtractor, SchemaHint, SchemaHintKind, SchemaLoader,
+    SchemaReference,
+};
 pub use validator::{
     FileValidationResult, PerformanceMetrics, ProgressCallback, ValidationConfig, ValidationEngine,
-    ValidationPhase, ValidationProgress, ValidationResults, ValidationStatus,
+    ValidationOutcome, ValidationPhase, ValidationProgress, ValidationResults, Violations,
 };
-pub use xmloxide::validation::xsd::XsdSchema;

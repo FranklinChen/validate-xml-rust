@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::cli::VerbosityLevel;
 use crate::validator::{
-    FileValidationResult, PerformanceMetrics, ValidationResults, ValidationStatus,
+    FileValidationResult, PerformanceMetrics, ValidationOutcome, ValidationResults,
 };
 
 /// Simple output formatter for human-readable results
@@ -50,7 +50,7 @@ impl Output {
 
                 if self.verbosity >= VerbosityLevel::Verbose {
                     for file_result in &results.file_results {
-                        if !file_result.status.is_valid() {
+                        if !file_result.outcome.is_valid() {
                             output.push_str(&self.format_file_result(file_result));
                             output.push('\n');
                         }
@@ -70,8 +70,8 @@ impl Output {
         let path_display = result.path.display();
         let duration_str = format_duration(result.duration);
 
-        match &result.status {
-            ValidationStatus::Valid => {
+        match &result.outcome {
+            ValidationOutcome::Valid { .. } => {
                 format!(
                     "{}  {} ({})",
                     self.colorize("✓ VALID", "32"),
@@ -79,24 +79,25 @@ impl Output {
                     duration_str
                 )
             }
-            ValidationStatus::Invalid { error_count } => {
+            ValidationOutcome::Invalid { violations, .. } => {
+                let error_count = violations.len();
                 let mut output = format!(
                     "{}  {} ({}) - {} error{}",
                     self.colorize("✗ INVALID", "31"),
                     path_display,
                     duration_str,
                     error_count,
-                    if *error_count == 1 { "" } else { "s" }
+                    if error_count == 1 { "" } else { "s" }
                 );
 
                 if self.verbosity >= VerbosityLevel::Verbose {
-                    for error_detail in &result.error_details {
+                    for error_detail in violations.iter() {
                         output.push_str(&format!("\n    {}", error_detail));
                     }
                 }
                 output
             }
-            ValidationStatus::Error { message } => {
+            ValidationOutcome::Error { message } => {
                 format!(
                     "{}  {} ({}) - {}",
                     self.colorize("⚠ ERROR", "33"),
@@ -105,7 +106,7 @@ impl Output {
                     message
                 )
             }
-            ValidationStatus::Skipped { reason } => {
+            ValidationOutcome::Skipped { reason } => {
                 format!(
                     "{}  {} ({}) - {}",
                     self.colorize("- SKIPPED", "36"),
@@ -171,11 +172,13 @@ impl Output {
         ));
         output.push_str(&format!(
             "  Concurrent validations: {}\n",
-            metrics.concurrent_validations
+            metrics.concurrency_limit
         ));
 
         if self.verbosity == VerbosityLevel::Debug {
-            output.push_str(&format!("  Peak memory: {} MB\n", metrics.peak_memory_mb));
+            if let Some(peak_memory_mb) = metrics.peak_memory_mb {
+                output.push_str(&format!("  Peak memory: {peak_memory_mb} MB\n"));
+            }
             output.push_str(&format!(
                 "  Cache hit rate: {:.1}%\n",
                 metrics.cache_hit_rate
@@ -219,13 +222,12 @@ mod tests {
             PerformanceMetrics {
                 total_duration: Duration::from_millis(100),
                 discovery_duration: Duration::ZERO,
-                schema_loading_duration: Duration::ZERO,
                 validation_duration: Duration::ZERO,
                 average_time_per_file: Duration::ZERO,
                 throughput_files_per_second: 0.0,
-                peak_memory_mb: 0,
+                peak_memory_mb: None,
                 cache_hit_rate: 0.0,
-                concurrent_validations: 1,
+                concurrency_limit: 1,
                 schema_cache_stats: SchemaCacheStats {
                     hits: 0,
                     misses: 0,

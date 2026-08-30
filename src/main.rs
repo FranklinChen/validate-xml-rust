@@ -44,14 +44,10 @@ async fn main() -> Result<(), ValidationError> {
     let validation_engine = ValidationEngine::new(
         schema_cache,
         http_client,
-        ValidationConfig {
-            max_concurrent_validations: config.threads,
-            validation_timeout: Duration::from_secs(config.timeout_seconds),
-            fail_fast: config.fail_fast,
-            show_progress: config.progress,
-            collect_metrics: true,
-            schema_override: config.schema.clone(),
-        },
+        ValidationConfig::new(config.threads, Duration::from_secs(config.timeout_seconds))?
+            .with_fail_fast(config.fail_fast)
+            .with_metrics(true)
+            .with_schema_override(config.schema.clone()),
     )?;
 
     let file_discovery = FileDiscovery::new().with_extensions(config.extensions.clone());
@@ -64,10 +60,11 @@ async fn main() -> Result<(), ValidationError> {
 
     let pb = if config.progress && !config.quiet {
         let pb = ProgressBar::new(0);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
-            .expect("Invalid progress bar template")
-            .progress_chars("█░"));
+        if let Ok(style) = ProgressStyle::default_bar().template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        ) {
+            pb.set_style(style.progress_chars("█░"));
+        }
         Some(pb)
     } else {
         None
@@ -105,14 +102,13 @@ async fn main() -> Result<(), ValidationError> {
         .run_comprehensive_validation(&config.path, &file_discovery, progress_callback)
         .await?;
 
-    if !config.quiet {
-        let output_formatter = Output::new(config.verbosity());
-        println!("{}", output_formatter.format_results(&results));
+    let output_formatter = Output::new(config.verbosity());
+    let formatted = output_formatter.format_results(&results);
+    if !formatted.is_empty() {
+        print!("{formatted}");
     }
 
-    if results.has_errors() && config.fail_fast {
-        std::process::exit(1);
-    } else if results.error_files > 0 {
+    if results.error_files > 0 {
         std::process::exit(2);
     } else if results.invalid_files > 0 {
         std::process::exit(3);

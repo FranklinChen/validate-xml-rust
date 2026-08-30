@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Updated quick-xml to 0.42, Tokio to 1.53, and globset to 0.4.20.
+- Added a floating `stable` toolchain file so local development and CI track the latest stable Rust release, with Rust 1.98 recorded as the current minimum.
+- Updated quick-xml name comparisons for its string-oriented 0.42 API.
+- Removed unused direct dependencies and narrowed Tokio/reqwest feature sets.
+- Integration tests now use Cargo's profile-correct test binary instead of a potentially stale release binary.
+- Corrected architecture and dependency-version documentation.
+- Restored hardened libxml2 as the single authoritative validator behind a compiled-schema typestate boundary.
+- File discovery now uses `ignore` on the blocking pool and reports traversal errors instead of silently dropping them.
+- Validation configuration uses non-zero concurrency and timeout invariants, and per-file outcomes now encode mutually exclusive state-specific data.
+- Schema hints retain namespace/location pairing and are matched to the document element; `xml-model` is a fallback.
+- Local cache keys include a SHA-256 content digest, and the disk cache now enforces its configured indexed-data budget using oldest-first eviction.
+- Unix builds select libxml2 through `pkg-config`; macOS CI verifies that the release binary actually links Homebrew's keg-only library.
+- Local schemas retain a base URI during compilation, enabling relative `xs:include` and `xs:import` while remote schemas remain isolated from libxml2's implicit network loading.
+- Timed-out blocking calls retain a concurrency permit until they actually return, and fail-fast drains already-admitted work without scheduling more files.
+- Compiled schemas now obey the configured in-memory TTL, and local graphs changed during compilation are rejected instead of being published under a stale digest.
+- Cache removal and clearing now invalidate compiled schemas as well as raw memory and disk entries.
+- Caller-owned local schema documents are retained for the full compiled-schema lifetime, with the compiled schema freed first.
+
+### Fixed
+
+- Replaced stale README claims and removed tool-specific attribution; usage, native prerequisites, schema selection, caching, deadlines, exit codes, and the libxml2 trust boundary now match the implementation.
+- CI no longer fails Linux-only Clippy checks, and the blocking-permit regression uses explicit synchronization instead of timing assumptions.
+- Schema parsing errors retain the schema path or URL instead of reporting an empty source.
+- Malformed input XML is classified as an XML parsing error rather than a validation failure.
+- Quiet mode reports error counts as documented.
+- Retry backoff arithmetic saturates for very large retry counts instead of overflowing.
+- Cache writes no longer leave a memory-only entry when disk persistence fails.
+- Disk-cache removal failures are propagated, and eviction statistics only count successful removals.
+- Cold cache insertion no longer records an artificial post-insert cache hit.
+- Persistent cache keys now use stable SHA-256 identities instead of Rust's unspecified `DefaultHasher` algorithm.
+- Schema parser diagnostics are captured per context instead of leaking directly to stderr behind a generic error.
+- Per-file deadline failures now have a dedicated error state instead of being mislabeled as configuration errors.
+- `--fail-fast` stops scheduling new work after the first invalid/error result.
+- Network errors no longer masquerade as cache errors.
+
+### Removed
+
+- Removed xmloxide and the `--backend` selector. Maintaining two XSD implementations added behavioral ambiguity and build/test surface without serving the project's libxml2-based deployment model.
+
 ## [0.4.0] - 2026-04-15
 
 ### Breaking Changes
@@ -53,7 +96,7 @@
   inside `tokio::task::spawn_blocking`. Because the pull parser stops at
   the root element's start tag, only prolog + root-tag bytes are actually
   read off disk — large XML bodies are never loaded into memory.
-- **CLAUDE.md updated** with the new module design, error model
+- **Repository guidance updated** with the new module design, error model
   distinction (XmlParsing vs SchemaParsing), and cache-key rationale.
 - All `schema_loader.rs` tests converted to return
   `Result<(), ValidationError>` and propagate via `?` rather than using

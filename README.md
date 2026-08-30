@@ -1,235 +1,174 @@
-# validate-xml: High-Performance XML Schema Validator
+# validate-xml
 
 [![CI](https://github.com/FranklinChen/validate-xml-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/FranklinChen/validate-xml-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.81+](https://img.shields.io/badge/rust-1.81+-orange.svg)](https://www.rust-lang.org)
+[![Rust stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-A blazingly fast CLI tool for validating XML files against XML Schemas, built in Rust with a focus on concurrent processing, intelligent caching, and low memory overhead.
+`validate-xml` validates an XML file or directory tree against XML Schema (XSD) using the system libxml2 library. It can discover schema hints from documents, fetch and cache standalone remote schemas, reuse compiled schemas, and validate files concurrently.
 
-**Validate 20,000 files in seconds** with automatic schema caching, concurrent validation, and comprehensive error reporting.
+## Requirements
 
----
+- Rust 1.98 or newer. [`rust-toolchain.toml`](rust-toolchain.toml) tracks the latest stable toolchain.
+- libxml2 development files.
+- `pkg-config` on Linux and macOS.
 
-## Features
-
-✨ **Core Capabilities**
-- **Concurrent Validation**: Uses all available CPU cores for parallel XML/XSD validation
-- **Schema Caching**: Two-tier caching (L1 memory, L2 disk) prevents redundant downloads
-- **Batch Processing**: Validate entire directory trees (100,000+ files) without memory exhaustion
-- **Output**: Text (human-readable) or Compact Summary
-- **Smart Error Reporting**: Line/column numbers, clear error messages, detailed diagnostics
-
-⚡ **Performance**
-- **Pure Rust**: Uses xmloxide for XML/XSD validation — no system dependencies or unsafe code
-- **Async I/O**: Tokio-based async operations for files and HTTP downloads
-- **In-Memory Caching**: First-run download + cross-run disk cache for schema reuse
-- **Bounded Memory**: Concurrent validation with configurable limits
-
-🏗️ **Architecture**
-- **Hybrid Async/Sync**: Async I/O (files, HTTP, caching) + sync CPU-bound validation (xmloxide)
-- **True Parallel Validation**: No global locks - 10x throughput on multi-core CPUs
-- **Parse Once, Validate Many**: Schemas are parsed once and shared safely across threads
-- **Modular Design**: Clean separation of concerns (discovery, loading, validation, reporting)
-- **Non-Blocking**: CPU-intensive tasks are offloaded to `spawn_blocking` to keep the async runtime responsive.
-
----
-
-## Prerequisites
-
-- **Rust**: 1.81+ (stable toolchain) with Cargo
-
----
-
-## Installation
-
-### From Source
+Install the native dependencies before building:
 
 ```bash
-git clone https://github.com/franklinchen/validate-xml-rust.git
+# Debian or Ubuntu
+sudo apt-get install libxml2-dev pkg-config
+
+# macOS with Homebrew
+brew install libxml2 pkg-config
+export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig"
+
+# Windows with vcpkg
+vcpkg install libxml2:x64-windows
+```
+
+The Windows build also needs the vcpkg `x64-windows` library directory in `LIB` and its binary directory in `PATH`; see [the CI workflow](.github/workflows/ci.yml) for the exact setup.
+
+## Install
+
+```bash
+git clone https://github.com/FranklinChen/validate-xml-rust.git
 cd validate-xml-rust
-cargo install --path .
+cargo install --locked --path .
 ```
 
-This installs the `validate-xml` binary to `~/.cargo/bin`. Add `~/.cargo/bin` to your `$PATH` if not already present.
+## Usage
 
----
-
-## Quick Start
-
-### Basic Usage
-
-Validate all XML files in a directory:
+Validate every `.xml` file below a directory:
 
 ```bash
-# Validate all .xml files (recursive)
-validate-xml /path/to/xml/files
-
-# Validate files with custom extensions
-validate-xml --extensions xml,xsd /path/to/files
-
-# Validate with verbose output and progress bar
-validate-xml --verbose /path/to/files
+validate-xml /path/to/documents
 ```
 
-### Schema Override
-
-Validate XML files against a specific XSD schema, even if the XML files don't contain `xsi:schemaLocation` attributes:
+Validate one file against an explicit local schema:
 
 ```bash
-# Validate using an explicit schema file
-validate-xml --schema /path/to/schema.xsd /path/to/xml/files
+validate-xml --schema /path/to/schema.xsd /path/to/document.xml
 ```
 
-### Output Formats
-
-Standard output includes validation status per file (in verbose mode) and a final summary.
-
-```
-Validation Summary:
-  Total files: 20000
-  Valid: 19950
-  Invalid: 50
-  Errors: 0
-  Skipped: 0
-  Success rate: 99.8%
-  Duration: 4.20s
-```
-
-### Error Message Format
-
-Validation errors are reported with precise location information for easy IDE integration:
-
-```
-path/to/file.xml:42:15: Missing required element 'id'
-path/to/file.xml:87:3: Element 'invalid' not allowed here
-path/to/file.xml:120:1: Schema error: Could not locate schema resource
-```
-
-### Remote Schema Example
-
-A robust way to test remote schema validation is using an Apache Maven POM file. A sample is provided in `samples/pom.xml`:
+Select more extensions and filesystem paths with globs:
 
 ```bash
-# Validate the provided sample which uses a remote Apache Maven schema
+validate-xml \
+  --extensions xml,cmdi \
+  --include '**/records/**' \
+  --exclude '**/fixtures/**' \
+  /path/to/documents
+```
+
+Show individual invalid/error results and performance information:
+
+```bash
+validate-xml --verbose /path/to/documents
+```
+
+`samples/pom.xml` exercises the standalone remote-schema path:
+
+```bash
 validate-xml samples/pom.xml
 ```
 
----
+That smoke test requires network access on the first run; subsequent runs can use the disk cache until its TTL expires.
 
-## Command-Line Reference
+## Schema selection
 
-### Basic Syntax
+Unless `--schema` is supplied, the validator reads schema hints from the XML prolog and document element:
 
-```bash
-validate-xml [OPTIONS] <DIRECTORY>
+- `xsi:schemaLocation` namespace/location pairs are retained, and the location matching the document element's namespace is selected.
+- `xsi:noNamespaceSchemaLocation` is used for a document element without a namespace.
+- `<?xml-model href="…"?>` is a fallback when no applicable `xsi` hint exists.
+
+Relative local schema paths are resolved against the XML document. Local XSDs receive a filesystem base URI, so relative `xs:include` and `xs:import` references work. The complete local composition graph contributes to the cache identity, so changing an included schema invalidates the compiled entry.
+
+HTTP and HTTPS schema hints are normalized and downloaded by the application's HTTP client. A remote schema is compiled from memory without an HTTP base URI. Remote `xs:include`, `xs:import`, `xs:redefine`, or `xs:override` composition is therefore rejected instead of allowing libxml2 to fetch nested resources outside the application's network and cache policy.
+
+## Command-line reference
+
+```text
+validate-xml [OPTIONS] <PATH>
 ```
 
-### Options
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `<PATH>` | required | XML file or directory tree to validate |
+| `-e, --extensions <LIST>` | `xml` | Comma-separated file extensions |
+| `-t, --threads <N>` | available parallelism | Maximum concurrent validations and blocking FFI operations |
+| `-v, --verbose` | off | Include individual failures and performance information |
+| `-q, --quiet` | off | Print only nonzero error/invalid counts |
+| `--cache-dir <PATH>` | platform cache directory | Raw-schema disk-cache directory |
+| `--cache-ttl <HOURS>` | `24` | Raw disk-cache TTL |
+| `--timeout <SECONDS>` | `30` | Per-file validation deadline and HTTP request timeout |
+| `--retry-attempts <N>` | `3` | Retry attempts for failed schema downloads |
+| `--include <GLOB>` | none | Include matching paths; repeat for multiple patterns |
+| `--exclude <GLOB>` | none | Exclude matching paths; repeat for multiple patterns |
+| `--progress` | automatic on an interactive terminal | Show a progress indicator |
+| `--fail-fast` | off | Stop scheduling after the first invalid/error result and drain admitted work |
+| `--max-cache-size <MB>` | `100` | Indexed raw-schema disk budget; evict oldest entries first |
+| `--schema <PATH>` | none | Use one local XSD for every input and skip hint extraction |
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--extensions <EXT>` | `xml` | XML file extension to match (comma-separated) |
-| `--threads <N>` | CPU cores | Max concurrent validation threads |
-| `--cache-dir <PATH>` | *Platform specific* | Schema cache directory |
-| `--cache-ttl <HOURS>` | `24` | Schema cache TTL in hours |
-| `--verbose` | - | Show detailed output |
-| `--quiet` | - | Suppress non-error output |
-| `--progress` | Auto | Show progress bar |
-| `--schema <PATH>` | - | Validate against a specific XSD (overrides schema references in XML) |
-| `--fail-fast` | - | Stop validation on first error |
-| `--help` | - | Show help message |
-| `--version` | - | Show version information |
+`--verbose` and `--quiet` are mutually exclusive. Zero threads, timeout, cache TTL, or cache size are rejected.
 
-### Exit Codes
+## Exit codes
 
 | Code | Meaning |
-|------|---------|
-| `0` | All files valid |
-| `1` | Configuration or CLI error |
-| `2` | Errors occurred during validation (system/network) |
-| `3` | Invalid files found (schema violations) |
+| --- | --- |
+| `0` | Every processed file is valid, or no invalid/error result occurred |
+| `1` | CLI, configuration, initialization, or top-level workflow error |
+| `2` | At least one file encountered a system, network, parsing, cache, or deadline error |
+| `3` | At least one file was well-formed but violated its schema |
 
----
+Files without an applicable schema hint are reported as skipped and do not by themselves produce a nonzero exit code.
 
-## How It Works
+## Execution and cache model
 
-### Architecture
+The pipeline is:
 
-The validator consists of four main components:
+```text
+CLI → file discovery → schema-hint extraction → schema loading → compilation → validation → reporting
+```
 
-**1. File Discovery**
-- Recursively traverses directory tree and filters by extension.
+- Directory traversal uses `ignore` on Tokio's blocking pool and applies `globset` include/exclude patterns.
+- File, HTTP, and cache I/O is asynchronous where appropriate. XML parsing and libxml2 work run on blocking workers.
+- A semaphore bounds actual blocking schema-compilation and validation operations to `--threads`.
+- A deadline cannot interrupt a libxml2 call that has already started. A timed-out call retains its semaphore permit until it returns, preventing later work from exceeding the configured FFI concurrency.
+- Fail-fast stops admitting new files after the first invalid/error result but drains work already admitted.
+- A `CompiledSchema` can only be constructed after libxml2 accepts the XSD. This keeps untrusted raw bytes distinct from compiled schemas in the type system.
 
-**2. Schema Loading**
-- Extracts schema URLs (xsi:schemaLocation, xsi:noNamespaceSchemaLocation).
-- Downloads remote schemas (HTTP/HTTPS) and caches raw bytes to memory and disk.
-- **Parse Once**: Parsed schema structures are cached in memory and shared safely across threads.
+Caching has three layers of responsibility:
 
-**3. Concurrent Validation**
-- Spawns async tasks bounded by `--threads`.
-- Heavy CPU tasks (parsing, validation) are offloaded to `spawn_blocking`.
-- **Thread Safety**: xmloxide is fully thread-safe — no global locks needed. Full parallel execution for XML validation.
+- A bounded, TTL-aware `moka` cache stores compiled `CompiledSchema` values and single-flights concurrent loads of the same key.
+- A second bounded, TTL-aware `moka` cache stores raw schema bytes in memory.
+- `cacache` stores raw schema bytes across processes. Application metadata provides expiry and oldest-first indexed-data eviction.
 
-**4. Error Reporting**
-- Aggregates and formats errors with line/column information.
+Local cache keys contain the canonical path plus a SHA-256 digest of the root XSD and every recursively referenced local schema. Remote cache keys use the normalized URL. Cache removal and clearing invalidate compiled and raw entries.
 
-### Caching Strategy
+## libxml2 boundary and trust model
 
-- **L1 Parsed Cache**: In-memory `moka` cache storing compiled `XsdSchema`. Ensures we parse any XSD exactly once.
-- **L2 Raw Cache**: Disk-backed `cacache` for persistent cross-run storage of schema bytes.
+The FFI is confined to [`src/backend.rs`](src/backend.rs). It uses checked buffer lengths, RAII wrappers, per-context structured error callbacks, and a distinct validation context per call. Schema compilation is serialized; successfully compiled schemas are immutable and shared. Caller-owned local schema documents remain alive for the compiled schema's lifetime and are freed after the schema.
 
----
+Input documents are parsed with `XML_PARSE_NONET` and without entity substitution. The validator never calls libxml2's global cleanup function. Unix builds select libxml2 through `pkg-config`; macOS CI additionally verifies that the release binary links Homebrew's library instead of Apple's system copy.
 
-## Performance Characteristics
-
-### Benchmarks (divan)
-
-Micro-benchmarks measuring the core validation engine (xmloxide 0.3.1, on Apple M3 Ultra):
-
-| Operation | Median Time | Throughput |
-|-----------|-------------|------------|
-| Schema Parsing | ~5.25 µs | 190,000/sec |
-| Valid XML Validation | ~11.0 µs | 91,000/sec |
-| Invalid XML Validation | ~10.0 µs | 100,000/sec |
-
-*Note: Validation includes reading the XML file and checking against the cached schema. These numbers measure xmloxide directly; schema-URL extraction (a few µs, amortized once per file) runs before the validation hot path and is not included.*
-
----
+These controls narrow the unsafe and I/O boundaries; they do not make arbitrary hostile XML or XSD risk-free. Keep libxml2 patched and use the tool only with documents and schemas from sources appropriate to your threat model. The separate [`libxml2-thread-safety-test`](https://github.com/FranklinChen/libxml2-thread-safety-test) stress-tests the shared-schema/per-call-context pattern, but is not a general security proof.
 
 ## Development
 
-### Building from Source
-
 ```bash
-# Clone repository
-git clone https://github.com/franklinchen/validate-xml-rust.git
-cd validate-xml-rust
-
-# Build (release, optimized)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
+cargo build --locked --release --all-features
+cargo bench --locked --all-features --no-run
 ```
 
-### Testing & Quality
+The integration tests use Cargo's profile-correct `CARGO_BIN_EXE_validate-xml` binary. Run `cargo test --lib` for a faster unit-only loop. Divan benchmarks exercise the same libxml2 compile/validate path as the application; this repository does not publish historical microbenchmark numbers as current guarantees.
 
-Before submitting changes, ensure you run:
-- `cargo fmt`
-- `cargo clippy`
-- `cargo test`
-
----
+See [`AGENTS.md`](AGENTS.md) for repository architecture notes and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ## License
 
-MIT License - See LICENSE file for details
-
----
-
-## Acknowledgements
-
-Google Gemini was used as an aid in improving this project, particularly in streamlining the architecture and test suite.
+[MIT](LICENSE)

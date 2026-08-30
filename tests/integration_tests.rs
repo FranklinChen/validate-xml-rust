@@ -2,6 +2,10 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
+fn command() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_validate-xml"))
+}
+
 #[test]
 fn test_cli_basic_validation() {
     let temp_dir = TempDir::new().unwrap();
@@ -28,7 +32,7 @@ fn test_cli_basic_validation() {
     )
     .unwrap();
 
-    let output = Command::new("./target/release/validate-xml")
+    let output = command()
         .arg(temp_dir.path())
         .output()
         .expect("Failed to run validation");
@@ -47,7 +51,7 @@ fn test_cli_basic_validation() {
 
 #[test]
 fn test_cli_invalid_path() {
-    let output = Command::new("./target/release/validate-xml")
+    let output = command()
         .arg("/nonexistent/path/that/really/should/not/exist")
         .output()
         .expect("Failed to run validation");
@@ -59,7 +63,7 @@ fn test_cli_invalid_path() {
 
 #[test]
 fn test_cli_help() {
-    let output = Command::new("./target/release/validate-xml")
+    let output = command()
         .arg("--help")
         .output()
         .expect("Failed to run validation");
@@ -67,4 +71,28 @@ fn test_cli_help() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage:"));
+}
+
+#[test]
+fn test_fail_fast_preserves_invalid_exit_code() {
+    let temp_dir = TempDir::new().unwrap();
+    let schema_path = temp_dir.path().join("schema.xsd");
+    fs::write(
+        &schema_path,
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:element name="expected" type="xs:string"/>
+</xs:schema>"#,
+    )
+    .unwrap();
+    let xml_path = temp_dir.path().join("invalid.xml");
+    fs::write(&xml_path, "<unexpected/>").unwrap();
+
+    let output = command()
+        .args(["--fail-fast", "--schema"])
+        .arg(schema_path)
+        .arg(xml_path)
+        .output()
+        .expect("Failed to run validation");
+
+    assert_eq!(output.status.code(), Some(3));
 }

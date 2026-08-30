@@ -2,24 +2,23 @@
 //!
 //! This module provides a high-performance validation engine using a hybrid architecture:
 //! - **Async I/O**: File discovery, schema loading, HTTP downloads, and caching
-//! - **Sync CPU-bound work**: XML validation (thread-safe, no spawn_blocking overhead)
-//! - **Concurrent orchestration**: tokio::spawn creates parallel validation tasks
-//! - **Bounded concurrency**: Semaphore limits prevent resource exhaustion
+//! - **Sync CPU-bound work**: schema parsing and XML validation on blocking threads
+//! - **Concurrent orchestration**: a bounded future set drives parallel validation tasks
+//! - **Bounded concurrency**: only the configured number of files are in flight
 //!
-//! The hybrid design maximizes throughput by avoiding spawn_blocking for CPU-bound
-//! XML validation operations, enabling true parallel validation across multiple cores.
+//! Blocking work is kept off Tokio's async worker threads while the scheduler bounds
+//! total validation concurrency and can stop scheduling promptly in fail-fast mode.
 
-use futures::future::try_join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
-use xmloxide::tree::Document;
-use xmloxide::validation::xsd::{XsdSchema, parse_xsd, validate_xsd};
-
+use crate::backend::{self, SchemaValidation};
 use crate::cache::SchemaCache;
 use crate::error::{Result, ValidationError};
 use crate::file_discovery::FileDiscovery;
@@ -30,64 +29,156 @@ use crate::schema_loader::SchemaLoader;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationConfig {
     /// Number of concurrent validation threads
-    pub max_concurrent_validations: usize,
-    /// Timeout for validation operations
-    pub validation_timeout: Duration,
-    /// Stop validation on first error
-    pub fail_fast: bool,
-    /// Show progress indicators
-    pub show_progress: bool,
+    max_concurrent_validations: NonZeroUsize,
+    /// Deadline for reporting a validation result. A libxml2 call that has
+    /// already started cannot be interrupted; it retains its concurrency slot
+    /// until returning even if this deadline has elapsed.
+    validation_timeout: Duration,
+    /// Stop scheduling new files on first error, then drain admitted work.
+    fail_fast: bool,
     /// Collect performance metrics
-    pub collect_metrics: bool,
+    collect_metrics: bool,
     /// Override schema path (skip schema extraction from XML)
-    pub schema_override: Option<PathBuf>,
+    schema_override: Option<PathBuf>,
 }
 
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_validations: num_cpus::get(),
+            max_concurrent_validations: std::thread::available_parallelism()
+                .unwrap_or(NonZeroUsize::MIN),
             validation_timeout: Duration::from_secs(30),
             fail_fast: false,
-            show_progress: false,
             collect_metrics: true,
             schema_override: None,
         }
     }
 }
 
-/// Status of a single file validation
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ValidationStatus {
-    /// File validated successfully
-    Valid,
-    /// File failed validation with schema violations
-    Invalid { error_count: i32 },
-    /// Internal error occurred during validation
-    Error { message: String },
-    /// File was skipped (e.g., no schema found)
-    Skipped { reason: String },
+impl ValidationConfig {
+    /// Construct a validated configuration. Zero concurrency or timeout is rejected.
+    pub fn new(max_concurrent_validations: usize, validation_timeout: Duration) -> Result<Self> {
+        let max_concurrent_validations =
+            NonZeroUsize::new(max_concurrent_validations).ok_or_else(|| {
+                ValidationError::Config("validation concurrency must be non-zero".into())
+            })?;
+        if validation_timeout.is_zero() {
+            return Err(ValidationError::Config(
+                "validation timeout must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            max_concurrent_validations,
+            validation_timeout,
+            ..Self::default()
+        })
+    }
+
+    pub fn with_fail_fast(mut self, fail_fast: bool) -> Self {
+        self.fail_fast = fail_fast;
+        self
+    }
+
+    pub fn with_metrics(mut self, collect_metrics: bool) -> Self {
+        self.collect_metrics = collect_metrics;
+        self
+    }
+
+    pub fn with_schema_override(mut self, schema_override: Option<PathBuf>) -> Self {
+        self.schema_override = schema_override;
+        self
+    }
+
+    pub fn max_concurrent_validations(&self) -> NonZeroUsize {
+        self.max_concurrent_validations
+    }
+
+    pub fn validation_timeout(&self) -> Duration {
+        self.validation_timeout
+    }
+
+    pub fn fail_fast(&self) -> bool {
+        self.fail_fast
+    }
+
+    pub fn collect_metrics(&self) -> bool {
+        self.collect_metrics
+    }
+
+    pub fn schema_override(&self) -> Option<&Path> {
+        self.schema_override.as_deref()
+    }
 }
 
-impl ValidationStatus {
-    /// Check if the validation was successful
+/// A non-empty collection of schema violations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Violations {
+    first: String,
+    rest: Vec<String>,
+}
+
+impl Violations {
+    fn from_vec(mut values: Vec<String>) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let first = values.remove(0);
+        Some(Self {
+            first,
+            rest: values,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.first.as_str()).chain(self.rest.iter().map(String::as_str))
+    }
+}
+
+/// Mutually exclusive outcome of validating one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationOutcome {
+    Valid {
+        schema: String,
+    },
+    Invalid {
+        schema: String,
+        violations: Violations,
+    },
+    Error {
+        message: String,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+impl ValidationOutcome {
     pub fn is_valid(&self) -> bool {
-        matches!(self, ValidationStatus::Valid)
+        matches!(self, Self::Valid { .. })
     }
-
-    /// Check if the validation failed due to schema violations
     pub fn is_invalid(&self) -> bool {
-        matches!(self, ValidationStatus::Invalid { .. })
+        matches!(self, Self::Invalid { .. })
     }
-
-    /// Check if an error occurred
     pub fn is_error(&self) -> bool {
-        matches!(self, ValidationStatus::Error { .. })
+        matches!(self, Self::Error { .. })
+    }
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
     }
 
-    /// Check if the file was skipped
-    pub fn is_skipped(&self) -> bool {
-        matches!(self, ValidationStatus::Skipped { .. })
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            Self::Valid { schema } | Self::Invalid { schema, .. } => Some(schema),
+            Self::Error { .. } | Self::Skipped { .. } => None,
+        }
     }
 }
 
@@ -96,14 +187,10 @@ impl ValidationStatus {
 pub struct FileValidationResult {
     /// Path to the validated file
     pub path: PathBuf,
-    /// Validation status
-    pub status: ValidationStatus,
-    /// Schema URL used for validation
-    pub schema_url: Option<String>,
+    /// Validation outcome and state-specific data
+    pub outcome: ValidationOutcome,
     /// Duration of validation
     pub duration: Duration,
-    /// Error details if validation failed
-    pub error_details: Vec<String>,
 }
 
 impl FileValidationResult {
@@ -111,10 +198,8 @@ impl FileValidationResult {
     pub fn valid(path: PathBuf, schema_url: String, duration: Duration) -> Self {
         Self {
             path,
-            status: ValidationStatus::Valid,
-            schema_url: Some(schema_url),
+            outcome: ValidationOutcome::Valid { schema: schema_url },
             duration,
-            error_details: Vec::new(),
         }
     }
 
@@ -122,16 +207,20 @@ impl FileValidationResult {
     pub fn invalid(
         path: PathBuf,
         schema_url: String,
-        error_count: i32,
         duration: Duration,
         error_details: Vec<String>,
     ) -> Self {
+        let violations = Violations::from_vec(error_details).unwrap_or_else(|| Violations {
+            first: "validator reported an invalid document without details".to_string(),
+            rest: Vec::new(),
+        });
         Self {
             path,
-            status: ValidationStatus::Invalid { error_count },
-            schema_url: Some(schema_url),
+            outcome: ValidationOutcome::Invalid {
+                schema: schema_url,
+                violations,
+            },
             duration,
-            error_details,
         }
     }
 
@@ -139,12 +228,10 @@ impl FileValidationResult {
     pub fn error(path: PathBuf, error: ValidationError, duration: Duration) -> Self {
         Self {
             path,
-            status: ValidationStatus::Error {
+            outcome: ValidationOutcome::Error {
                 message: error.to_string(),
             },
-            schema_url: None,
             duration,
-            error_details: vec![error.to_string()],
         }
     }
 
@@ -152,13 +239,13 @@ impl FileValidationResult {
     pub fn skipped(path: PathBuf, reason: String, duration: Duration) -> Self {
         Self {
             path,
-            status: ValidationStatus::Skipped {
-                reason: reason.clone(),
-            },
-            schema_url: None,
+            outcome: ValidationOutcome::Skipped { reason },
             duration,
-            error_details: vec![reason],
         }
+    }
+
+    pub fn is_failure(&self) -> bool {
+        self.outcome.is_invalid() || self.outcome.is_error()
     }
 }
 
@@ -197,20 +284,18 @@ pub struct PerformanceMetrics {
     pub total_duration: Duration,
     /// File discovery duration
     pub discovery_duration: Duration,
-    /// Schema loading duration
-    pub schema_loading_duration: Duration,
     /// Validation duration
     pub validation_duration: Duration,
     /// Average time per file
     pub average_time_per_file: Duration,
     /// Files processed per second
     pub throughput_files_per_second: f64,
-    /// Peak memory usage in MB
-    pub peak_memory_mb: u64,
+    /// Peak memory usage in MB, when supported by the operating system
+    pub peak_memory_mb: Option<u64>,
     /// Cache hit rate percentage
     pub cache_hit_rate: f64,
-    /// Number of concurrent validations
-    pub concurrent_validations: usize,
+    /// Configured upper bound on concurrent validations
+    pub concurrency_limit: usize,
     /// Schema cache statistics
     pub schema_cache_stats: SchemaCacheStats,
 }
@@ -219,12 +304,12 @@ pub struct PerformanceMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SchemaCacheStats {
     /// Number of cache hits
-    pub hits: usize,
+    pub hits: u64,
     /// Number of cache misses
-    pub misses: usize,
+    pub misses: u64,
     /// Number of schemas loaded
     pub schemas_loaded: usize,
-    /// Total cache size in bytes
+    /// Total indexed schema-data size in bytes
     pub cache_size_bytes: u64,
 }
 
@@ -265,17 +350,17 @@ impl ValidationResults {
         let mut schemas_used = std::collections::HashSet::new();
 
         for result in &file_results {
-            match result.status {
-                ValidationStatus::Valid => valid_files += 1,
-                ValidationStatus::Invalid { .. } => invalid_files += 1,
-                ValidationStatus::Error { .. } => error_files += 1,
-                ValidationStatus::Skipped { .. } => skipped_files += 1,
+            match result.outcome {
+                ValidationOutcome::Valid { .. } => valid_files += 1,
+                ValidationOutcome::Invalid { .. } => invalid_files += 1,
+                ValidationOutcome::Error { .. } => error_files += 1,
+                ValidationOutcome::Skipped { .. } => skipped_files += 1,
             }
 
             total_duration += result.duration;
 
-            if let Some(ref schema_url) = result.schema_url {
-                schemas_used.insert(schema_url.clone());
+            if let Some(schema) = result.outcome.schema() {
+                schemas_used.insert(schema.to_owned());
             }
         }
 
@@ -289,7 +374,6 @@ impl ValidationResults {
         let performance_metrics = PerformanceMetrics {
             total_duration,
             discovery_duration: Duration::ZERO,
-            schema_loading_duration: Duration::ZERO,
             validation_duration: total_duration,
             average_time_per_file: average_duration,
             throughput_files_per_second: if total_duration.as_secs_f64() > 0.0 {
@@ -297,9 +381,9 @@ impl ValidationResults {
             } else {
                 0.0
             },
-            peak_memory_mb: 0,
+            peak_memory_mb: None,
             cache_hit_rate: 0.0,
-            concurrent_validations: 1,
+            concurrency_limit: 1,
             schema_cache_stats: SchemaCacheStats {
                 hits: 0,
                 misses: 0,
@@ -359,11 +443,11 @@ pub type ProgressCallback = Arc<dyn Fn(ValidationProgress) + Send + Sync>;
 ///
 /// Orchestrates validation using a hybrid architecture:
 /// - **Async operations**: File discovery, schema loading/caching, HTTP downloads
-/// - **Sync operations**: XML validation (CPU-bound, thread-safe, runs directly in tokio tasks)
-/// - **Concurrency**: Semaphore-bounded tokio::spawn tasks for parallel validation
-/// - **Result aggregation**: futures::try_join_all collects all validation results
+/// - **Sync operations**: schema parsing and XML validation on blocking threads
+/// - **Concurrency**: a bounded in-flight future set drives parallel validation
+/// - **Result aggregation**: completed outcomes are summarized without contradictory state
 ///
-/// This design enables true parallel validation across CPU cores without spawn_blocking overhead.
+/// This design enables parallel validation without blocking Tokio's async workers.
 pub struct ValidationEngine {
     schema_loader: Arc<SchemaLoader>,
     config: ValidationConfig,
@@ -405,13 +489,12 @@ impl ValidationEngine {
         let mut performance_metrics = PerformanceMetrics {
             total_duration: Duration::ZERO,
             discovery_duration: Duration::ZERO,
-            schema_loading_duration: Duration::ZERO,
             validation_duration: Duration::ZERO,
             average_time_per_file: Duration::ZERO,
             throughput_files_per_second: 0.0,
-            peak_memory_mb: 0,
+            peak_memory_mb: None,
             cache_hit_rate: 0.0,
-            concurrent_validations: self.config.max_concurrent_validations,
+            concurrency_limit: self.config.max_concurrent_validations.get(),
             schema_cache_stats: SchemaCacheStats::default(),
         };
 
@@ -464,9 +547,17 @@ impl ValidationEngine {
             });
         }
 
-        // Collect cache statistics if available
-        if let Ok(cache_stats) = self.collect_cache_statistics().await {
-            performance_metrics.schema_cache_stats = cache_stats;
+        if self.config.collect_metrics {
+            if let Ok(cache_stats) = self.collect_cache_statistics().await {
+                let requests = cache_stats.hits + cache_stats.misses;
+                performance_metrics.cache_hit_rate = if requests == 0 {
+                    0.0
+                } else {
+                    cache_stats.hits as f64 * 100.0 / requests as f64
+                };
+                performance_metrics.schema_cache_stats = cache_stats;
+            }
+            performance_metrics.peak_memory_mb = self.get_peak_memory_usage().await;
         }
 
         // Calculate final metrics
@@ -482,11 +573,6 @@ impl ValidationEngine {
             } else {
                 0.0
             };
-
-        // Collect memory usage if metrics are enabled
-        if self.config.collect_metrics {
-            performance_metrics.peak_memory_mb = self.get_peak_memory_usage().await;
-        }
 
         let final_results = ValidationResults::with_metrics(results, performance_metrics);
 
@@ -519,92 +605,92 @@ impl ValidationEngine {
         }
 
         let total_files = files.len();
-        let completed = Arc::new(AtomicUsize::new(0));
+        let mut remaining = files.into_iter();
+        let mut pending = FuturesUnordered::new();
+        let concurrency = self.config.max_concurrent_validations.get();
+        let blocking_slots = Arc::new(Semaphore::new(concurrency));
 
-        // Create a semaphore to limit concurrent validations
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.config.max_concurrent_validations,
-        ));
+        for file_path in remaining.by_ref().take(concurrency) {
+            pending.push(Self::validate_with_timeout(
+                file_path,
+                Arc::clone(&self.schema_loader),
+                Arc::clone(&blocking_slots),
+                self.config.schema_override.clone(),
+                self.config.validation_timeout,
+            ));
+        }
 
-        // Create validation tasks for each file
-        let validation_tasks: Vec<_> = files
-            .into_iter()
-            .map(|file_path| {
-                let schema_loader = Arc::clone(&self.schema_loader);
-                let semaphore = Arc::clone(&semaphore);
-                let timeout = self.config.validation_timeout;
-                let progress_callback = progress_callback.clone();
-                let completed = Arc::clone(&completed);
-                let schema_override = self.config.schema_override.clone();
+        let mut file_results = Vec::with_capacity(total_files);
+        let mut stop_scheduling = false;
+        while let Some((file_path, validation_result)) = pending.next().await {
+            let should_stop = self.config.fail_fast && validation_result.is_failure();
+            file_results.push(validation_result);
 
-                tokio::spawn(async move {
-                    // Acquire semaphore permit to limit concurrency
-                    let _permit = semaphore.acquire().await.map_err(|_| {
-                        ValidationError::Config(
-                            "Failed to acquire validation semaphore".to_string(),
-                        )
-                    })?;
+            if let Some(ref callback) = progress_callback {
+                callback(ValidationProgress {
+                    current_file: Some(file_path),
+                    completed: file_results.len(),
+                    total: total_files,
+                    phase: ValidationPhase::Validation,
+                });
+            }
 
-                    // Validate single file with timeout
-                    let result = tokio::time::timeout(
-                        timeout,
-                        Self::validate_single_file_internal(
-                            file_path.clone(),
-                            schema_loader,
-                            schema_override,
-                        ),
-                    )
-                    .await;
+            if should_stop {
+                // Do not detach work that was already admitted. Draining the
+                // in-flight set keeps ownership/lifecycle behavior predictable
+                // while still preventing any new files from being scheduled.
+                stop_scheduling = true;
+            }
 
-                    let validation_result = match result {
-                        Ok(validation_result) => validation_result,
-                        Err(_) => FileValidationResult::error(
-                            file_path.clone(),
-                            ValidationError::Config(format!(
-                                "Validation timeout after {:?}",
-                                timeout
-                            )),
-                            timeout,
-                        ),
-                    };
-
-                    // Update progress
-                    let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if let Some(ref callback) = progress_callback {
-                        callback(ValidationProgress {
-                            current_file: Some(file_path),
-                            completed: done,
-                            total: total_files,
-                            phase: ValidationPhase::Validation,
-                        });
-                    }
-
-                    Ok::<FileValidationResult, ValidationError>(validation_result)
-                })
-            })
-            .collect();
-
-        // Collect all results
-        let task_results =
-            try_join_all(validation_tasks)
-                .await
-                .map_err(|e| ValidationError::Concurrency {
-                    details: format!("Task join error: {}", e),
-                })?;
-
-        // Extract FileValidationResult from Result<FileValidationResult, ValidationError>
-        let mut file_results = Vec::with_capacity(task_results.len());
-        for result in task_results {
-            file_results.push(result?);
+            if !stop_scheduling && let Some(next_path) = remaining.next() {
+                pending.push(Self::validate_with_timeout(
+                    next_path,
+                    Arc::clone(&self.schema_loader),
+                    Arc::clone(&blocking_slots),
+                    self.config.schema_override.clone(),
+                    self.config.validation_timeout,
+                ));
+            }
         }
 
         Ok(file_results)
+    }
+
+    async fn validate_with_timeout(
+        file_path: PathBuf,
+        schema_loader: Arc<SchemaLoader>,
+        blocking_slots: Arc<Semaphore>,
+        schema_override: Option<PathBuf>,
+        timeout: Duration,
+    ) -> (PathBuf, FileValidationResult) {
+        let result = tokio::time::timeout(
+            timeout,
+            Self::validate_single_file_internal(
+                file_path.clone(),
+                schema_loader,
+                blocking_slots,
+                schema_override,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            FileValidationResult::error(
+                file_path.clone(),
+                ValidationError::ValidationDeadline {
+                    file: file_path.clone(),
+                    timeout_ms: timeout.as_millis(),
+                },
+                timeout,
+            )
+        });
+        (file_path, result)
     }
 
     /// Validate a single file (internal implementation)
     async fn validate_single_file_internal(
         file_path: PathBuf,
         schema_loader: Arc<SchemaLoader>,
+        blocking_slots: Arc<Semaphore>,
         schema_override: Option<PathBuf>,
     ) -> FileValidationResult {
         let start_time = Instant::now();
@@ -615,11 +701,11 @@ impl ValidationEngine {
         } else {
             match schema_loader
                 .extractor()
-                .extract_schema_urls(&file_path)
+                .extract_schema_hints(&file_path)
                 .await
             {
-                Ok(refs) => match refs.into_iter().next() {
-                    Some(r) => r,
+                Ok(extracted) => match extracted.applicable().cloned() {
+                    Some(reference) => reference,
                     None => {
                         return FileValidationResult::skipped(
                             file_path,
@@ -641,11 +727,23 @@ impl ValidationEngine {
 
         // `cache_key` (namespaced) keys the L1 cache and prevents
         // local/remote collisions; `schema_display` is the bare path/URL
-        // surfaced to users via `FileValidationResult::schema_url`.
-        let cache_key = schema_ref.cache_key();
+        // surfaced to users through the outcome's schema field.
+        let cache_key = match schema_loader.cache_key(&schema_ref).await {
+            Ok(key) => key,
+            Err(error) => {
+                return FileValidationResult::error(file_path, error, start_time.elapsed());
+            }
+        };
         let schema_display = schema_ref.to_string();
+        let parse_source = schema_display.clone();
+        let local_schema_path = match &schema_ref {
+            crate::schema_loader::SchemaReference::Local(path) => Some(path.clone()),
+            crate::schema_loader::SchemaReference::Remote(_) => None,
+        };
         let loader_clone = schema_loader.clone();
+        let compile_slots = Arc::clone(&blocking_slots);
 
+        let expected_cache_key = cache_key.clone();
         let schema = match schema_loader
             .cache()
             .parsed()
@@ -654,21 +752,24 @@ impl ValidationEngine {
 
                 // Parse schema on a blocking thread (CPU-intensive for large schemas)
                 let data = cached_bytes.data.clone();
-                let parsed: XsdSchema = tokio::task::spawn_blocking(move || {
-                    let schema_str =
-                        std::str::from_utf8(&data).map_err(|e| ValidationError::SchemaParsing {
-                            url: String::new(),
-                            details: format!("Schema is not valid UTF-8: {}", e),
-                        })?;
-                    parse_xsd(schema_str).map_err(|e| ValidationError::SchemaParsing {
-                        url: String::new(),
-                        details: e.message,
-                    })
+                let compile_source = parse_source.clone();
+                let parsed = Self::spawn_bounded(compile_slots, move || {
+                    backend::compile(&data, &compile_source, local_schema_path.as_deref())
                 })
-                .await
-                .map_err(|e| ValidationError::Concurrency {
-                    details: e.to_string(),
-                })??;
+                .await?;
+
+                // Local schema graphs are multiple independently readable
+                // files. Do not publish a compiled value under the digest
+                // observed before loading if any member changed meanwhile.
+                if matches!(schema_ref, crate::schema_loader::SchemaReference::Local(_)) {
+                    let observed_cache_key = loader_clone.cache_key(&schema_ref).await?;
+                    if observed_cache_key != expected_cache_key {
+                        return Err(ValidationError::SchemaParsing {
+                            url: parse_source,
+                            details: "local schema graph changed while it was being compiled; retry validation".into(),
+                        });
+                    }
+                }
 
                 Ok(Arc::new(parsed))
             })
@@ -682,59 +783,57 @@ impl ValidationEngine {
         let validate_path = file_path.clone();
         let validate_schema = schema;
 
-        let validation_result = tokio::task::spawn_blocking(move || {
-            let doc = Document::parse_file(&validate_path).map_err(|e| {
-                ValidationError::ValidationFailed {
-                    file: validate_path.clone(),
-                    details: e.to_string(),
-                }
-            })?;
-            Ok::<_, ValidationError>(validate_xsd(&doc, &validate_schema))
+        let validation_result = Self::spawn_bounded(blocking_slots, move || {
+            backend::validate(&validate_schema, &validate_path)
         })
         .await;
 
         let duration = start_time.elapsed();
 
         match validation_result {
-            Ok(Ok(result)) => {
-                if result.is_valid {
-                    FileValidationResult::valid(file_path, schema_display, duration)
-                } else {
-                    let errors: Vec<String> = result
-                        .errors
-                        .iter()
-                        .map(|e| match (e.line, e.column) {
-                            (Some(l), Some(c)) => format!("{}:{}: {}", l, c, e.message),
-                            (Some(l), None) => format!("{}: {}", l, e.message),
-                            _ => e.message.clone(),
-                        })
-                        .collect();
-                    FileValidationResult::invalid(
-                        file_path,
-                        schema_display,
-                        errors.len() as i32,
-                        duration,
-                        errors,
-                    )
-                }
+            Ok(SchemaValidation::Valid) => {
+                FileValidationResult::valid(file_path, schema_display, duration)
             }
-            Ok(Err(e)) => FileValidationResult::error(file_path, e, duration),
-            Err(e) => FileValidationResult::error(
-                file_path,
-                ValidationError::Concurrency {
-                    details: format!("Join error: {}", e),
-                },
-                duration,
-            ),
+            Ok(SchemaValidation::Invalid(errors)) => {
+                FileValidationResult::invalid(file_path, schema_display, duration, errors)
+            }
+            Err(e) => FileValidationResult::error(file_path, e, duration),
         }
+    }
+
+    /// Run one FFI operation without allowing timed-out/dropped futures to
+    /// exceed the configured blocking-work limit. The permit moves into the
+    /// closure because Tokio cannot cancel a `spawn_blocking` task once started.
+    async fn spawn_bounded<T, F>(blocking_slots: Arc<Semaphore>, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let permit =
+            blocking_slots
+                .acquire_owned()
+                .await
+                .map_err(|error| ValidationError::Concurrency {
+                    details: format!("blocking-work limiter closed: {error}"),
+                })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .map_err(|error| ValidationError::Concurrency {
+            details: format!("blocking task join error: {error}"),
+        })?
     }
 
     /// Validate a single file (public interface)
     pub async fn validate_single_file(&self, file_path: &Path) -> Result<FileValidationResult> {
-        let result = Self::validate_single_file_internal(
+        let (_, result) = Self::validate_with_timeout(
             file_path.to_path_buf(),
             Arc::clone(&self.schema_loader),
+            Arc::new(Semaphore::new(self.config.max_concurrent_validations.get())),
             self.config.schema_override.clone(),
+            self.config.validation_timeout,
         )
         .await;
 
@@ -757,10 +856,8 @@ impl ValidationEngine {
         let cache = self.schema_loader.cache();
         match cache.stats().await {
             Ok(stats) => Ok(SchemaCacheStats {
-                // Note: moka cache doesn't track hits/misses directly,
-                // so we report the entry counts as a proxy for loaded schemas
-                hits: 0,
-                misses: 0,
+                hits: stats.access.memory_hits + stats.access.disk_hits,
+                misses: stats.access.misses,
                 schemas_loaded: stats.memory.entry_count as usize,
                 cache_size_bytes: stats.disk.total_size,
             }),
@@ -769,26 +866,22 @@ impl ValidationEngine {
     }
 
     /// Get peak memory usage in MB
-    async fn get_peak_memory_usage(&self) -> u64 {
-        // This is a placeholder implementation
-        // In a real implementation, you might use system APIs or memory profiling
+    async fn get_peak_memory_usage(&self) -> Option<u64> {
         #[cfg(target_os = "linux")]
         {
             if let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await {
                 for line in status.lines() {
-                    if line.starts_with("VmPeak:") {
-                        if let Some(kb_str) = line.split_whitespace().nth(1) {
-                            if let Ok(kb) = kb_str.parse::<u64>() {
-                                return kb / 1024; // Convert KB to MB
-                            }
-                        }
+                    if line.starts_with("VmPeak:")
+                        && let Some(kb_str) = line.split_whitespace().nth(1)
+                        && let Ok(kb) = kb_str.parse::<u64>()
+                    {
+                        return Some(kb / 1024); // Convert KB to MB
                     }
                 }
             }
         }
 
-        // Fallback: estimate based on process memory
-        0
+        None
     }
 
     /// Create a comprehensive validation workflow coordinator
@@ -831,14 +924,7 @@ mod tests {
         let http_client = AsyncHttpClient::new(http_config).unwrap();
 
         // Create validation config
-        let validation_config = ValidationConfig {
-            max_concurrent_validations: 2, // Small number for testing
-            validation_timeout: Duration::from_secs(5),
-            fail_fast: false,
-            show_progress: false,
-            collect_metrics: true,
-            schema_override: None,
-        };
+        let validation_config = ValidationConfig::new(2, Duration::from_secs(5)).unwrap();
 
         let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
         (engine, temp_dir)
@@ -858,19 +944,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validation_status_predicates() {
-        assert!(ValidationStatus::Valid.is_valid());
-        assert!(!ValidationStatus::Valid.is_invalid());
-        assert!(!ValidationStatus::Valid.is_error());
-        assert!(!ValidationStatus::Valid.is_skipped());
+    async fn test_validation_outcome_predicates() {
+        let valid = ValidationOutcome::Valid {
+            schema: "test.xsd".into(),
+        };
+        assert!(valid.is_valid());
+        assert!(!valid.is_invalid());
+        assert!(!valid.is_error());
+        assert!(!valid.is_skipped());
 
-        let invalid = ValidationStatus::Invalid { error_count: 1 };
+        let invalid = ValidationOutcome::Invalid {
+            schema: "test.xsd".into(),
+            violations: Violations::from_vec(vec!["invalid".into()]).unwrap(),
+        };
         assert!(!invalid.is_valid());
         assert!(invalid.is_invalid());
         assert!(!invalid.is_error());
         assert!(!invalid.is_skipped());
 
-        let error = ValidationStatus::Error {
+        let error = ValidationOutcome::Error {
             message: "test".to_string(),
         };
         assert!(!error.is_valid());
@@ -878,7 +970,7 @@ mod tests {
         assert!(error.is_error());
         assert!(!error.is_skipped());
 
-        let skipped = ValidationStatus::Skipped {
+        let skipped = ValidationOutcome::Skipped {
             reason: "test".to_string(),
         };
         assert!(!skipped.is_valid());
@@ -897,16 +989,15 @@ mod tests {
             "http://example.com/schema.xsd".to_string(),
             duration,
         );
-        assert!(valid_result.status.is_valid());
+        assert!(valid_result.outcome.is_valid());
         assert_eq!(
-            valid_result.schema_url,
-            Some("http://example.com/schema.xsd".to_string())
+            valid_result.outcome.schema(),
+            Some("http://example.com/schema.xsd")
         );
 
         let invalid_result = FileValidationResult::invalid(
             path.clone(),
             "http://example.com/schema.xsd".to_string(),
-            3,
             duration,
             vec![
                 "error1".to_string(),
@@ -914,18 +1005,18 @@ mod tests {
                 "error3".to_string(),
             ],
         );
-        assert!(invalid_result.status.is_invalid());
+        assert!(invalid_result.outcome.is_invalid());
 
         let error_result = FileValidationResult::error(
             path.clone(),
             ValidationError::Config("test error".to_string()),
             duration,
         );
-        assert!(error_result.status.is_error());
+        assert!(error_result.outcome.is_error());
 
         let skipped_result =
             FileValidationResult::skipped(path, "no schema found".to_string(), duration);
-        assert!(skipped_result.status.is_skipped());
+        assert!(skipped_result.outcome.is_skipped());
     }
 
     #[tokio::test]
@@ -944,7 +1035,6 @@ mod tests {
             FileValidationResult::invalid(
                 PathBuf::from("invalid1.xml"),
                 "schema2.xsd".to_string(),
-                2,
                 Duration::from_millis(200),
                 vec![],
             ),
@@ -1032,8 +1122,11 @@ mod tests {
 
         let result = engine.validate_single_file(xml_file.path()).await.unwrap();
 
-        assert!(result.status.is_skipped());
-        assert!(result.error_details[0].contains("No schema URL found"));
+        assert!(result.outcome.is_skipped());
+        assert!(matches!(
+            &result.outcome,
+            ValidationOutcome::Skipped { reason } if reason.contains("No schema URL found")
+        ));
     }
 
     #[tokio::test]
@@ -1072,11 +1165,11 @@ mod tests {
 
         // Should be valid since the XML matches the schema
         assert!(
-            result.status.is_valid(),
+            result.outcome.is_valid(),
             "Expected valid result, got: {:?}",
             result
         );
-        assert!(result.schema_url.is_some());
+        assert!(result.outcome.schema().is_some());
     }
 
     #[tokio::test]
@@ -1093,8 +1186,11 @@ mod tests {
 
         let result = engine.validate_single_file(xml_file.path()).await.unwrap();
 
-        assert!(result.status.is_error());
-        assert!(result.error_details[0].contains("Schema not found"));
+        assert!(result.outcome.is_error());
+        assert!(matches!(
+            &result.outcome,
+            ValidationOutcome::Error { message } if message.contains("Schema not found")
+        ));
     }
 
     #[tokio::test]
@@ -1132,7 +1228,7 @@ mod tests {
         assert_eq!(results.len(), 5);
         for result in results {
             assert!(
-                result.status.is_valid(),
+                result.outcome.is_valid(),
                 "Expected valid result, got: {:?}",
                 result
             );
@@ -1158,14 +1254,7 @@ mod tests {
         let http_client = AsyncHttpClient::new(http_config).unwrap();
 
         // Create validation config with very short timeout
-        let validation_config = ValidationConfig {
-            max_concurrent_validations: 1,
-            validation_timeout: Duration::from_millis(1), // Very short timeout
-            fail_fast: false,
-            show_progress: false,
-            collect_metrics: true,
-            schema_override: None,
-        };
+        let validation_config = ValidationConfig::new(1, Duration::from_millis(1)).unwrap();
 
         let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
 
@@ -1182,17 +1271,107 @@ mod tests {
         assert_eq!(results.len(), 1);
         // Result should either be skipped (no schema) or timeout error
         let result = &results[0];
-        assert!(result.status.is_skipped() || result.status.is_error());
+        assert!(result.outcome.is_skipped() || result.outcome.is_error());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_blocking_work_keeps_its_concurrency_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(ValidationEngine::spawn_bounded(
+            Arc::clone(&slots),
+            move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv()
+                    .map_err(|error| ValidationError::Concurrency {
+                        details: format!("test release channel closed: {error}"),
+                    })?;
+                Ok(())
+            },
+        ));
+
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(slots.available_permits(), 0);
+
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(5), slots.acquire())
+            .await
+            .expect("blocking operation did not release its permit")
+            .expect("semaphore closed unexpectedly");
+        drop(permit);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test]
     async fn test_validation_config_default() {
         let config = ValidationConfig::default();
 
-        assert!(config.max_concurrent_validations > 0);
-        assert!(config.validation_timeout > Duration::ZERO);
-        assert!(!config.fail_fast);
-        assert!(!config.show_progress);
+        assert!(config.max_concurrent_validations().get() > 0);
+        assert!(config.validation_timeout() > Duration::ZERO);
+        assert!(!config.fail_fast());
+    }
+
+    #[test]
+    fn validation_config_rejects_zero_values() {
+        assert!(ValidationConfig::new(0, Duration::from_secs(1)).is_err());
+        assert!(ValidationConfig::new(1, Duration::ZERO).is_err());
+    }
+
+    #[tokio::test]
+    async fn fail_fast_stops_scheduling_new_files() {
+        let (mut engine, temp_dir) = create_test_validation_engine();
+        let schema = temp_dir.path().join("schema.xsd");
+        tokio::fs::write(
+            &schema,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="expected" type="xs:string"/></xs:schema>"#,
+        )
+        .await
+        .unwrap();
+        let invalid = temp_dir.path().join("a-invalid.xml");
+        let unscheduled = temp_dir.path().join("b-valid.xml");
+        tokio::fs::write(&invalid, "<wrong/>").await.unwrap();
+        tokio::fs::write(&unscheduled, "<expected>ok</expected>")
+            .await
+            .unwrap();
+        engine.config = ValidationConfig::new(1, Duration::from_secs(5))
+            .unwrap()
+            .with_fail_fast(true)
+            .with_schema_override(Some(schema));
+
+        let results = engine
+            .validate_files(vec![invalid, unscheduled])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].outcome.is_invalid());
+    }
+
+    #[tokio::test]
+    async fn fail_fast_drains_files_already_admitted() {
+        let (mut engine, temp_dir) = create_test_validation_engine();
+        let schema = temp_dir.path().join("schema.xsd");
+        tokio::fs::write(
+            &schema,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="expected" type="xs:string"/></xs:schema>"#,
+        )
+        .await
+        .unwrap();
+        let first = temp_dir.path().join("first.xml");
+        let second = temp_dir.path().join("second.xml");
+        tokio::fs::write(&first, "<wrong/>").await.unwrap();
+        tokio::fs::write(&second, "<also-wrong/>").await.unwrap();
+        engine.config = ValidationConfig::new(2, Duration::from_secs(5))
+            .unwrap()
+            .with_fail_fast(true)
+            .with_schema_override(Some(schema));
+
+        let results = engine.validate_files(vec![first, second]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(FileValidationResult::is_failure));
     }
 
     #[tokio::test]
@@ -1202,7 +1381,7 @@ mod tests {
         let _schema_loader = engine.schema_loader();
         let config = engine.config();
 
-        assert_eq!(config.max_concurrent_validations, 2);
+        assert_eq!(config.max_concurrent_validations().get(), 2);
     }
 
     #[tokio::test]
@@ -1244,14 +1423,9 @@ mod tests {
         let cache = Arc::new(SchemaCache::new(cache_config));
         let http_config = HttpClientConfig::default();
         let http_client = AsyncHttpClient::new(http_config).unwrap();
-        let validation_config = ValidationConfig {
-            max_concurrent_validations: 2,
-            validation_timeout: Duration::from_secs(5),
-            fail_fast: false,
-            show_progress: false,
-            collect_metrics: true,
-            schema_override: Some(schema_file.clone()),
-        };
+        let validation_config = ValidationConfig::new(2, Duration::from_secs(5))
+            .unwrap()
+            .with_schema_override(Some(schema_file.clone()));
 
         let engine = ValidationEngine::new(cache, http_client, validation_config).unwrap();
 
@@ -1259,11 +1433,14 @@ mod tests {
 
         // Should be valid — the override schema was used instead of extracting from XML
         assert!(
-            result.status.is_valid(),
+            result.outcome.is_valid(),
             "Expected valid result with schema override, got: {:?}",
             result
         );
-        assert_eq!(result.schema_url, Some(schema_file.display().to_string()));
+        assert_eq!(
+            result.outcome.schema(),
+            Some(schema_file.display().to_string()).as_deref()
+        );
     }
 
     /// End-to-end regression test for the L1 parsed-schema cache-key
@@ -1323,26 +1500,19 @@ mod tests {
         let engine = ValidationEngine::new(
             cache,
             http_client,
-            ValidationConfig {
-                max_concurrent_validations: 2,
-                validation_timeout: Duration::from_secs(5),
-                fail_fast: false,
-                show_progress: false,
-                collect_metrics: true,
-                schema_override: None,
-            },
+            ValidationConfig::new(2, Duration::from_secs(5))?,
         )?;
 
         let result_a = engine.validate_single_file(&xml_a).await?;
         let result_b = engine.validate_single_file(&xml_b).await?;
 
         assert!(
-            result_a.status.is_valid(),
+            result_a.outcome.is_valid(),
             "doc A should validate against its own schema; got {:?}",
             result_a
         );
         assert!(
-            result_b.status.is_valid(),
+            result_b.outcome.is_valid(),
             "doc B should validate against its own schema; the old cache-key bug \
              would have reused A's parsed schema here, failing with an Invalid; got {:?}",
             result_b

@@ -1,9 +1,9 @@
 use crate::error::{Result, ValidationError};
 use globset::{GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
-use tokio::fs;
 
-/// Async file discovery engine that replaces ignore::Walk with async alternatives
+/// File discovery performed on Tokio's blocking pool with `ignore`'s robust walker.
 #[derive(Debug, Clone)]
 pub struct FileDiscovery {
     /// File extensions to include (e.g., ["xml", "xsd"])
@@ -98,99 +98,52 @@ impl FileDiscovery {
 
     /// Discover files asynchronously in the given path (file or directory)
     pub async fn discover_files(&self, path: &Path) -> Result<Vec<PathBuf>> {
-        let metadata = fs::metadata(path).await.map_err(ValidationError::from)?;
+        let discovery = self.clone();
+        let root = path.to_path_buf();
+        tokio::task::spawn_blocking(move || discovery.discover_blocking(&root))
+            .await
+            .map_err(|error| ValidationError::Concurrency {
+                details: format!("file-discovery task failed: {error}"),
+            })?
+    }
 
+    fn discover_blocking(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let metadata = std::fs::metadata(path)?;
         if metadata.is_file() {
-            // If it's a file, just return it if it matches patterns
-            // Note: we check should_process but relax extension check if it's explicitly provided?
-            // Actually, keep should_process strict.
-            if self.should_process(path) {
-                return Ok(vec![path.to_path_buf()]);
-            } else {
-                return Ok(Vec::new());
-            }
+            return Ok(self
+                .should_process(path)
+                .then(|| path.to_path_buf())
+                .into_iter()
+                .collect());
+        }
+
+        let mut builder = WalkBuilder::new(path);
+        builder
+            .follow_links(self.follow_symlinks)
+            .hidden(false)
+            .parents(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+        if let Some(depth) = self.max_depth {
+            builder.max_depth(Some(depth.saturating_add(1)));
         }
 
         let mut files = Vec::new();
-
-        // Start with depth -1 so that files in root directory are at depth 0
-        let mut read_dir = fs::read_dir(path).await.map_err(ValidationError::from)?;
-
-        while let Some(entry) = read_dir.next_entry().await.map_err(ValidationError::from)? {
-            let entry_path = entry.path();
-
-            // Handle symlinks
-            if entry_path.is_symlink() && !self.follow_symlinks {
-                continue;
-            }
-
-            // Process each entry at depth 0
-            if let Err(e) = self
-                .discover_files_recursive(&entry_path, 0, &mut files)
-                .await
+        for entry in builder.build() {
+            let entry = entry.map_err(|error| ValidationError::FileSystemTraversal {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && self.should_process(entry.path())
             {
-                // Log error but continue processing other files
-                eprintln!("Warning: Error processing {}: {}", entry_path.display(), e);
+                files.push(entry.into_path());
             }
         }
-
+        files.sort_unstable();
         Ok(files)
-    }
-
-    /// Recursive helper for discovering files
-    fn discover_files_recursive<'a>(
-        &'a self,
-        path: &'a Path,
-        depth: usize,
-        files: &'a mut Vec<PathBuf>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move {
-            // Check depth limit - allow processing at current depth, but don't go deeper
-            if let Some(max_depth) = self.max_depth
-                && depth > max_depth
-            {
-                return Ok(());
-            }
-
-            let metadata = fs::metadata(path).await.map_err(ValidationError::from)?;
-
-            if metadata.is_file() {
-                if self.should_process(path) {
-                    files.push(path.to_path_buf());
-                }
-            } else if metadata.is_dir() {
-                // Only recurse into directories if we can still go deeper
-                if let Some(max_depth) = self.max_depth
-                    && depth >= max_depth
-                {
-                    return Ok(());
-                }
-
-                let mut read_dir = fs::read_dir(path).await.map_err(ValidationError::from)?;
-
-                while let Some(entry) =
-                    read_dir.next_entry().await.map_err(ValidationError::from)?
-                {
-                    let entry_path = entry.path();
-
-                    // Handle symlinks
-                    if entry_path.is_symlink() && !self.follow_symlinks {
-                        continue;
-                    }
-
-                    // Recursively process subdirectories and files
-                    if let Err(e) = self
-                        .discover_files_recursive(&entry_path, depth + 1, files)
-                        .await
-                    {
-                        // Log error but continue processing other files
-                        eprintln!("Warning: Error processing {}: {}", entry_path.display(), e);
-                    }
-                }
-            }
-
-            Ok(())
-        })
     }
 
     /// Check if a file should be processed based on extensions and patterns

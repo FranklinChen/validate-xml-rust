@@ -168,7 +168,8 @@ impl AsyncHttpClient {
 
     /// Wait before retry with exponential backoff
     async fn wait_before_retry(&self, attempt: u32) {
-        let delay_ms = self.config.retry_delay_ms * 2_u64.pow(attempt);
+        let multiplier = 2_u64.checked_pow(attempt).unwrap_or(u64::MAX);
+        let delay_ms = self.config.retry_delay_ms.saturating_mul(multiplier);
         let capped_delay = delay_ms.min(self.config.max_retry_delay_ms);
         sleep(Duration::from_millis(capped_delay)).await;
     }

@@ -22,6 +22,9 @@ pub enum ValidationError {
     #[error("Request timeout: {url} after {timeout_seconds} seconds")]
     Timeout { url: String, timeout_seconds: u64 },
 
+    #[error("Validation deadline exceeded: {file} after {timeout_ms}ms")]
+    ValidationDeadline { file: PathBuf, timeout_ms: u128 },
+
     #[error("Schema parsing error: {url} - {details}")]
     SchemaParsing { url: String, details: String },
 
@@ -40,6 +43,9 @@ pub enum ValidationError {
 
     #[error("Cache error: {0}")]
     Cache(String),
+
+    #[error("Network error: {0}")]
+    Network(String),
 
     #[error("Configuration error: {0}")]
     Config(String),
@@ -155,8 +161,7 @@ impl From<CacheError> for ValidationError {
 
 impl From<NetworkError> for ValidationError {
     fn from(err: NetworkError) -> Self {
-        // Create a generic HTTP error by wrapping the network error details
-        ValidationError::Cache(format!("Network error: {}", err))
+        ValidationError::Network(err.to_string())
     }
 }
 

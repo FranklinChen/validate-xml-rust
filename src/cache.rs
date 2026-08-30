@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -7,22 +8,34 @@ use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+use crate::backend::CompiledSchema;
 use crate::error::ValidationError;
-use xmloxide::validation::xsd::XsdSchema;
 
 /// Cache configuration
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheConfig {
     /// Cache directory path
     pub directory: PathBuf,
     /// Time-to-live for cached schemas in hours
     pub ttl_hours: u64,
-    /// Maximum cache size in megabytes
+    /// Maximum indexed schema-data budget in megabytes
     pub max_size_mb: u64,
     /// Maximum number of entries in memory cache
     pub max_memory_entries: u64,
     /// Memory cache TTL in seconds
     pub memory_ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            directory: std::env::temp_dir().join("validate-xml"),
+            ttl_hours: 24,
+            max_size_mb: 100,
+            max_memory_entries: 1_000,
+            memory_ttl_seconds: 3_600,
+        }
+    }
 }
 
 /// Result type for cache operations
@@ -34,12 +47,19 @@ pub type CacheResult<T> = Result<T, ValidationError>;
 /// It uses `moka` to handle concurrent access and "thundering herd" protection
 /// (ensuring a schema is only parsed once even if multiple files request it simultaneously).
 pub struct ParsedSchemaCache {
-    cache: Cache<String, Arc<XsdSchema>>,
+    cache: Cache<String, Arc<CompiledSchema>>,
 }
 
 impl ParsedSchemaCache {
     pub fn new(max_capacity: u64) -> Self {
-        let cache = Cache::builder().max_capacity(max_capacity).build();
+        Self::with_ttl(max_capacity, Duration::from_secs(3_600))
+    }
+
+    pub fn with_ttl(max_capacity: u64, ttl: Duration) -> Self {
+        let cache = Cache::builder()
+            .max_capacity(max_capacity)
+            .time_to_live(ttl)
+            .build();
 
         Self { cache }
     }
@@ -48,12 +68,15 @@ impl ParsedSchemaCache {
     ///
     /// The `loader` future is only executed if the key is missing.
     /// Moka ensures that concurrent requests for the same key wait for the single leader to finish.
-    pub async fn get_or_load<F, Fut, E>(&self, key: String, loader: F) -> Result<Arc<XsdSchema>, E>
+    pub async fn get_or_load<F, Fut, E>(
+        &self,
+        key: String,
+        loader: F,
+    ) -> Result<Arc<CompiledSchema>, E>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Arc<XsdSchema>, E>>,
-        E: Send + Sync + Clone + 'static, // Error type must be thread-safe and Clone
-        ValidationError: From<E>,         // Allow conversion to ValidationError if needed
+        Fut: std::future::Future<Output = Result<Arc<CompiledSchema>, E>>,
+        E: Send + Sync + Clone + 'static,
     {
         self.cache
             .try_get_with(key, loader())
@@ -61,8 +84,17 @@ impl ParsedSchemaCache {
             .map_err(|e| (*e).clone()) // Unwrap the Arc<E> from moka
     }
 
-    pub async fn get(&self, key: &str) -> Option<Arc<XsdSchema>> {
+    pub async fn get(&self, key: &str) -> Option<Arc<CompiledSchema>> {
         self.cache.get(key).await
+    }
+
+    pub async fn remove(&self, key: &str) {
+        self.cache.remove(key).await;
+    }
+
+    pub async fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
     }
 }
 
@@ -143,12 +175,9 @@ impl DiskCache {
 
     /// Generate a cache key from a URL
     pub fn generate_key(url: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        format!("schema_{:x}", hasher.finish())
+        format!("schema_{:x}", Sha256::digest(url.as_bytes()))
     }
 
     /// Get schema from disk cache
@@ -158,7 +187,7 @@ impl DiskCache {
             Some(metadata) if !metadata.is_expired() => metadata,
             _ => {
                 // Clean up expired entry
-                let _ = self.remove(key).await;
+                self.remove(key).await?;
                 return Ok(None);
             }
         };
@@ -166,7 +195,10 @@ impl DiskCache {
         // Get the actual data
         match cacache::read(&self.cache_dir, key).await {
             Ok(data) => Ok(Some(CachedSchema::new(data, metadata))),
-            Err(cacache::Error::EntryNotFound(_, _)) => Ok(None),
+            Err(cacache::Error::EntryNotFound(_, _)) => {
+                self.remove(key).await?;
+                Ok(None)
+            }
             Err(e) => Err(ValidationError::Cache(format!(
                 "Failed to read from disk cache: {}",
                 e
@@ -181,48 +213,68 @@ impl DiskCache {
             .await
             .map_err(|e| ValidationError::Cache(format!("Failed to write to disk cache: {}", e)))?;
 
-        // Store the metadata
-        self.set_metadata(key, &metadata).await?;
+        // Store metadata second. If it fails, remove the index entry so callers
+        // never observe a successful raw write paired with missing metadata.
+        if let Err(metadata_error) = self.set_metadata(key, &metadata).await {
+            return match cacache::remove(&self.cache_dir, key).await {
+                Ok(()) | Err(cacache::Error::EntryNotFound(_, _)) => Err(metadata_error),
+                Err(rollback_error) => Err(ValidationError::Cache(format!(
+                    "{metadata_error}; additionally failed to roll back cache entry {key}: {rollback_error}"
+                ))),
+            };
+        }
 
         Ok(())
     }
 
     /// Remove entry from disk cache
     pub async fn remove(&self, key: &str) -> CacheResult<()> {
-        // Remove data
-        let _ = cacache::remove(&self.cache_dir, key).await;
+        match cacache::remove(&self.cache_dir, key).await {
+            Ok(()) | Err(cacache::Error::EntryNotFound(_, _)) => {}
+            Err(cacache::Error::IoError(error, _))
+                if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ValidationError::Cache(format!(
+                    "Failed to remove disk cache entry {key}: {error}"
+                )));
+            }
+        }
 
-        // Remove metadata
         let metadata_path = self.metadata_path(key);
-        let _ = fs::remove_file(metadata_path).await;
+        match fs::remove_file(metadata_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ValidationError::Cache(format!(
+                    "Failed to remove metadata for {key}: {error}"
+                )));
+            }
+        }
 
         Ok(())
     }
 
     /// Check if entry exists and is not expired
     pub async fn contains(&self, key: &str) -> CacheResult<bool> {
-        match self.get_metadata(key).await? {
-            Some(metadata) => Ok(!metadata.is_expired()),
-            None => Ok(false),
-        }
+        Ok(self.get(key).await?.is_some())
     }
 
     /// Get cache statistics
     pub async fn stats(&self) -> CacheResult<CacheStats> {
         let mut stats = CacheStats::default();
 
-        // Get cacache index - handle errors gracefully
-        match cacache::index::ls(&self.cache_dir).collect::<Result<Vec<_>, _>>() {
-            Ok(entries) => {
-                for entry in entries {
-                    stats.entry_count += 1;
-                    stats.total_size += entry.size as u64;
-                }
-            }
-            Err(_) => {
-                // If we can't read the index, assume empty cache
-                // This can happen if the cache directory doesn't exist yet
-            }
+        if !fs::try_exists(self.cache_dir.join("index-v5")).await? {
+            return Ok(stats);
+        }
+
+        let entries = cacache::index::ls(&self.cache_dir)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ValidationError::Cache(format!("Failed to read cache index: {error}"))
+            })?;
+        for entry in entries {
+            stats.entry_count += 1;
+            stats.total_size += entry.size as u64;
         }
 
         Ok(stats)
@@ -237,19 +289,34 @@ impl DiskCache {
             Ok(entries) => {
                 for entry in entries {
                     // Check if metadata exists and is expired
-                    if let Ok(Some(metadata)) = self.get_metadata(&entry.key).await
-                        && metadata.is_expired()
-                    {
-                        cleanup_stats.expired_entries += 1;
-                        cleanup_stats.freed_bytes += entry.size as u64;
-
-                        if let Err(e) = self.remove(&entry.key).await {
-                            cleanup_stats
-                                .errors
-                                .push(format!("Failed to remove {}: {}", entry.key, e));
-                        } else {
-                            cleanup_stats.removed_entries += 1;
+                    match self.get_metadata(&entry.key).await {
+                        Ok(Some(metadata)) if metadata.is_expired() => {
+                            cleanup_stats.expired_entries += 1;
+                            if let Err(error) = self.remove(&entry.key).await {
+                                cleanup_stats
+                                    .errors
+                                    .push(format!("Failed to remove {}: {error}", entry.key));
+                            } else {
+                                cleanup_stats.removed_entries += 1;
+                                cleanup_stats.freed_bytes += entry.size as u64;
+                            }
                         }
+                        Ok(None) => {
+                            if let Err(error) = self.remove(&entry.key).await {
+                                cleanup_stats.errors.push(format!(
+                                    "Failed to remove orphaned entry {}: {error}",
+                                    entry.key
+                                ));
+                            } else {
+                                cleanup_stats.removed_entries += 1;
+                                cleanup_stats.freed_bytes += entry.size as u64;
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Err(error) => cleanup_stats.errors.push(format!(
+                            "Failed to read metadata for {}: {error}",
+                            entry.key
+                        )),
                     }
                 }
             }
@@ -261,6 +328,29 @@ impl DiskCache {
         }
 
         Ok(cleanup_stats)
+    }
+
+    /// Evict oldest index entries until the configured byte budget is met.
+    pub async fn enforce_max_size(&self, max_bytes: u64) -> CacheResult<CleanupStats> {
+        let mut entries = cacache::index::ls(&self.cache_dir)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ValidationError::Cache(format!("Failed to read cache index: {error}"))
+            })?;
+        let mut total = entries.iter().map(|entry| entry.size as u64).sum::<u64>();
+        entries.sort_unstable_by_key(|entry| entry.time);
+        let mut stats = CleanupStats::default();
+        for entry in entries {
+            if total <= max_bytes {
+                break;
+            }
+            self.remove(&entry.key).await?;
+            let size = entry.size as u64;
+            total = total.saturating_sub(size);
+            stats.removed_entries += 1;
+            stats.freed_bytes += size;
+        }
+        Ok(stats)
     }
 
     /// Get metadata for a cache entry
@@ -369,6 +459,9 @@ pub struct SchemaCache {
     disk_cache: DiskCache,
     parsed_cache: ParsedSchemaCache,
     config: CacheConfig,
+    memory_hits: AtomicU64,
+    disk_hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl SchemaCache {
@@ -380,14 +473,22 @@ impl SchemaCache {
 
         let disk_cache = DiskCache::new(config.directory.clone());
 
-        // Limit parsed schemas to max_memory_entries (same as raw memory cache)
-        let parsed_cache = ParsedSchemaCache::new(config.max_memory_entries);
+        // Apply the same capacity and TTL to compiled and raw memory entries.
+        // In particular, a remote compiled schema must not outlive the
+        // configured in-memory freshness window indefinitely.
+        let parsed_cache = ParsedSchemaCache::with_ttl(
+            config.max_memory_entries,
+            Duration::from_secs(config.memory_ttl_seconds),
+        );
 
         Self {
             memory_cache,
             disk_cache,
             parsed_cache,
             config,
+            memory_hits: AtomicU64::new(0),
+            disk_hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -402,17 +503,20 @@ impl SchemaCache {
 
         // Try memory cache first (fastest)
         if let Some(schema) = self.memory_cache.get(&key).await {
+            self.memory_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(schema));
         }
 
         // Try disk cache (persistent across runs)
         if let Some(schema) = self.disk_cache.get(&key).await? {
+            self.disk_hits.fetch_add(1, Ordering::Relaxed);
             let schema_arc = Arc::new(schema);
             // Populate memory cache for future access
             self.memory_cache.set(key, schema_arc.clone()).await;
             return Ok(Some(schema_arc));
         }
 
+        self.misses.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
 
@@ -423,7 +527,7 @@ impl SchemaCache {
         data: Vec<u8>,
         etag: Option<String>,
         last_modified: Option<String>,
-    ) -> CacheResult<()> {
+    ) -> CacheResult<Arc<CachedSchema>> {
         let key = DiskCache::generate_key(url);
         let ttl = Duration::from_secs(self.config.ttl_hours * 3600);
 
@@ -434,19 +538,39 @@ impl SchemaCache {
 
         let cached_schema = Arc::new(CachedSchema::new(data.clone(), metadata.clone()));
 
-        // Store in memory cache
-        self.memory_cache.set(key.clone(), cached_schema).await;
+        let max_bytes = self.config.max_size_mb.saturating_mul(1024 * 1024);
+        if data.len() as u64 > max_bytes {
+            return Err(ValidationError::ResourceExhaustion {
+                resource: "schema disk cache".into(),
+                details: format!(
+                    "entry is {} bytes but cache limit is {max_bytes} bytes",
+                    data.len()
+                ),
+            });
+        }
 
-        // Store in disk cache for persistence
+        // Persist first so a disk error cannot leave a memory-only entry
+        // behind after reporting that the operation failed.
         self.disk_cache.set(&key, &data, metadata).await?;
+        if let Err(eviction_error) = self.disk_cache.enforce_max_size(max_bytes).await {
+            return match self.disk_cache.remove(&key).await {
+                Ok(()) => Err(eviction_error),
+                Err(rollback_error) => Err(ValidationError::Cache(format!(
+                    "{eviction_error}; additionally failed to roll back newly cached entry {key}: {rollback_error}"
+                ))),
+            };
+        }
 
-        Ok(())
+        self.memory_cache.set(key, Arc::clone(&cached_schema)).await;
+
+        Ok(cached_schema)
     }
 
     /// Remove entry from both cache tiers
     pub async fn remove(&self, url: &str) -> CacheResult<()> {
         let key = DiskCache::generate_key(url);
 
+        self.parsed_cache.remove(url).await;
         self.memory_cache.remove(&key).await;
         self.disk_cache.remove(&key).await?;
 
@@ -472,6 +596,11 @@ impl SchemaCache {
         Ok(ComprehensiveCacheStats {
             memory: memory_stats,
             disk: disk_stats,
+            access: CacheAccessStats {
+                memory_hits: self.memory_hits.load(Ordering::Relaxed),
+                disk_hits: self.disk_hits.load(Ordering::Relaxed),
+                misses: self.misses.load(Ordering::Relaxed),
+            },
         })
     }
 
@@ -484,12 +613,22 @@ impl SchemaCache {
 
     /// Clear all entries from both cache tiers
     pub async fn clear(&self) -> CacheResult<()> {
+        self.parsed_cache.clear().await;
         self.memory_cache.clear().await;
 
         // Clear disk cache by clearing the entire cache directory
         cacache::clear(&self.config.directory)
             .await
             .map_err(|e| ValidationError::Cache(format!("Failed to clear disk cache: {}", e)))?;
+        match fs::remove_dir_all(self.config.directory.join("metadata")).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ValidationError::Cache(format!(
+                    "Failed to clear cache metadata: {error}"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -512,6 +651,14 @@ pub struct MemoryCacheStats {
 pub struct ComprehensiveCacheStats {
     pub memory: MemoryCacheStats,
     pub disk: CacheStats,
+    pub access: CacheAccessStats,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheAccessStats {
+    pub memory_hits: u64,
+    pub disk_hits: u64,
+    pub misses: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -585,6 +732,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parsed_cache_obeys_ttl_and_clear() {
+        let cache = ParsedSchemaCache::with_ttl(10, Duration::from_millis(10));
+        let schema = cache
+            .get_or_load("schema".into(), || async {
+                crate::backend::compile(
+                    br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>"#,
+                    "cache-test.xsd",
+                    None,
+                )
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(cache.get("schema").await.is_none());
+
+        cache
+            .get_or_load("schema".into(), || async {
+                Ok::<_, String>(Arc::clone(&schema))
+            })
+            .await
+            .unwrap();
+        cache.clear().await;
+        assert!(cache.get("schema").await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_disk_cache_basic_operations() {
         let (config, _temp_dir) = create_test_config();
         let cache = DiskCache::new(config.directory.clone());
@@ -610,6 +786,25 @@ mod tests {
         // Test remove
         cache.remove(key).await.unwrap();
         assert!(cache.get(key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disk_cache_remove_propagates_real_filesystem_errors() {
+        let (config, _temp_dir) = create_test_config();
+        let cache = DiskCache::new(config.directory.clone());
+        let key = "remove_error";
+        let metadata = CacheMetadata::new(
+            key.to_string(),
+            "https://example.com/schema.xsd".to_string(),
+            Duration::from_secs(60),
+        );
+        cache.set(key, b"schema", metadata).await.unwrap();
+
+        let metadata_path = cache.metadata_path(key);
+        tokio::fs::remove_file(&metadata_path).await.unwrap();
+        tokio::fs::create_dir(&metadata_path).await.unwrap();
+
+        assert!(cache.remove(key).await.is_err());
     }
 
     #[tokio::test]
@@ -665,6 +860,25 @@ mod tests {
         // Verify memory cache was repopulated
         let key = DiskCache::generate_key(url);
         assert!(cache.memory_cache.contains(&key).await);
+    }
+
+    #[tokio::test]
+    async fn inserting_after_a_miss_does_not_count_as_a_hit() {
+        let (config, _temp_dir) = create_test_config();
+        let cache = SchemaCache::new(config);
+        let url = "https://example.com/cold.xsd";
+
+        assert!(cache.get(url).await.unwrap().is_none());
+        let inserted = cache
+            .set(url, b"schema".to_vec(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(inserted.data.as_ref(), b"schema");
+
+        let stats = cache.stats().await.unwrap();
+        assert_eq!(stats.access.misses, 1);
+        assert_eq!(stats.access.memory_hits, 0);
+        assert_eq!(stats.access.disk_hits, 0);
     }
 
     #[tokio::test]
@@ -742,5 +956,37 @@ mod tests {
 
         // Disk cache should be empty or at least reduced
         assert!(stats_after.disk.entry_count <= stats_before.disk.entry_count);
+    }
+
+    #[tokio::test]
+    async fn disk_budget_evicts_oldest_entries() {
+        let (mut config, _temp_dir) = create_test_config();
+        config.max_size_mb = 1;
+        let cache = SchemaCache::new(config);
+        cache
+            .set(
+                "https://example.test/old.xsd",
+                vec![b'a'; 700_000],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        cache
+            .set(
+                "https://example.test/new.xsd",
+                vec![b'b'; 700_000],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stats = cache.stats().await.unwrap();
+        assert!(stats.disk.total_size <= 1024 * 1024);
+        let old_key = DiskCache::generate_key("https://example.test/old.xsd");
+        let new_key = DiskCache::generate_key("https://example.test/new.xsd");
+        assert!(!cache.disk_cache.contains(&old_key).await.unwrap());
+        assert!(cache.disk_cache.contains(&new_key).await.unwrap());
     }
 }
